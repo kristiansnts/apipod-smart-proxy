@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  apipod-proxy:
+    build: .
+    container_name: apipod-smart-proxy
+    ports:
+      - "8081:8081"
+    environment:
+      - ANTIGRAVITY_URL=${ANTIGRAVITY_URL:-http://host.docker.internal:8080}
+      - ANTIGRAVITY_KEY=${ANTIGRAVITY_KEY}
+      - ADMIN_SECRET=${ADMIN_SECRET}
+      - PORT=8081
+      - DATABASE_PATH=/root/data/proxy.db
+    volumes:
+      - ./data:/root/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - apipod-network
+
+networks:
+  apipod-network:
+    driver: bridge
+
+volumes:
+  data:
