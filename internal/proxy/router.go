@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"fmt"
 	"math/rand"
 	"time"
+
+	"github.com/rpay/apipod-smart-proxy/internal/database"
 )
 
 // UpstreamTarget represents which upstream to use
@@ -13,88 +16,69 @@ const (
 	UpstreamGHCP        UpstreamTarget = "ghcp"
 )
 
-// RoutingResult contains the routed model and target upstream
+// RoutingResult contains the routed model, target upstream, and quota item ID for logging
 type RoutingResult struct {
-	Model    string
-	Upstream UpstreamTarget
+	Model       string
+	Upstream    UpstreamTarget
+	QuotaItemID int64
 }
 
-// Router handles smart model routing
+// Router handles DB-driven weighted model routing
 type Router struct {
+	db   *database.DB
 	rand *rand.Rand
 }
 
-// NewRouter creates a new smart router
-func NewRouter() *Router {
-	// Create a new random source with current time as seed
+// NewRouter creates a new smart router backed by the database
+func NewRouter(db *database.DB) *Router {
 	src := rand.NewSource(time.Now().UnixNano())
 	return &Router{
+		db:   db,
 		rand: rand.New(src),
 	}
 }
 
-// RouteModel applies smart routing logic to the requested model
-// Returns the target model and which upstream to use
-//
-// Routing logic for "cursor-pro-sonnet" (10 parts total):
-//   - 1/10 (10%) → "claude-sonnet-4-5" (via Antigravity)
-//   - 2/10 (20%) → "claude-sonnet-4-5" (via GHCP)
-//   - 4/10 (40%) → "gemini-3-flash" (via Antigravity)
-//   - 3/10 (30%) → "gpt-5-mini" (via GHCP)
-//
-// Other routing:
-//   - "claude-*" models → route to GHCP
-//   - Other models → route to Antigravity
-func (r *Router) RouteModel(requestedModel string) RoutingResult {
-	// Smart routing for cursor-pro-sonnet with 4-way distribution
-	if requestedModel == "cursor-pro-sonnet" {
-		// Generate random number between 0.0 and 1.0
-		roll := r.rand.Float64()
-
-		// Distribution:
-		// 0.00 - 0.10 (10%) = Sonnet via Antigravity
-		// 0.10 - 0.30 (20%) = Sonnet via GHCP
-		// 0.30 - 0.70 (40%) = Gemini via Antigravity
-		// 0.70 - 1.00 (30%) = GPT via GHCP
-
-		if roll < 0.10 {
-			// 10%: Claude Sonnet via Antigravity
-			return RoutingResult{
-				Model:    "claude-sonnet-4-5-thinking",
-				Upstream: UpstreamAntigravity,
-			}
-		} else if roll < 0.30 {
-			// 20%: Claude Sonnet via GHCP
-			return RoutingResult{
-				Model:    "claude-sonnet-4.5",
-				Upstream: UpstreamGHCP,
-			}
-		} else if roll < 0.70 {
-			// 40%: Gemini via Antigravity
-			return RoutingResult{
-				Model:    "gemini-3-flash",
-				Upstream: UpstreamAntigravity,
-			}
-		} else {
-			// 30%: GPT via GHCP
-			return RoutingResult{
-				Model:    "gpt-5-mini",
-				Upstream: UpstreamGHCP,
-			}
-		}
+// RouteModel selects a model/upstream for the given subscription using weighted random selection.
+// Returns the routing result (model, upstream, quota_item_id).
+// If the subscription has no quota items, falls back to Antigravity with the original model name.
+func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, error) {
+	items, err := r.db.GetQuotaItemsBySubID(subID)
+	if err != nil {
+		return RoutingResult{}, fmt.Errorf("route model: %w", err)
 	}
 
-	// Route Claude models to GHCP
-	if len(requestedModel) >= 7 && requestedModel[:7] == "claude-" {
+	if len(items) == 0 {
+		// No quota items configured — pass through unchanged
 		return RoutingResult{
-			Model:    requestedModel,
-			Upstream: UpstreamGHCP,
+			Model:    fallbackModel,
+			Upstream: UpstreamAntigravity,
+		}, nil
+	}
+
+	// Weighted random selection
+	totalWeight := 0
+	for _, item := range items {
+		totalWeight += item.PercentageWeight
+	}
+
+	roll := r.rand.Intn(totalWeight)
+	cumulative := 0
+	for _, item := range items {
+		cumulative += item.PercentageWeight
+		if roll < cumulative {
+			return RoutingResult{
+				Model:       item.ModelName,
+				Upstream:    UpstreamTarget(item.Upstream),
+				QuotaItemID: item.QuotaID,
+			}, nil
 		}
 	}
 
-	// All other models (including direct gpt-5-mini, gemini, etc) go to Antigravity
+	// Fallback (should never reach here)
+	last := items[len(items)-1]
 	return RoutingResult{
-		Model:    requestedModel,
-		Upstream: UpstreamAntigravity,
-	}
+		Model:       last.ModelName,
+		Upstream:    UpstreamTarget(last.Upstream),
+		QuotaItemID: last.QuotaID,
+	}, nil
 }

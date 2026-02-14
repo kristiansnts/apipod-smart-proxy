@@ -3,62 +3,73 @@ package database
 import (
 	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/lib/pq"
 )
 
-// DB wraps the SQLite database connection
+// DB wraps the PostgreSQL database connection
 type DB struct {
 	conn *sql.DB
 }
 
 const schema = `
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    api_key TEXT UNIQUE NOT NULL,
-    name TEXT,
-    tier TEXT DEFAULT 'elite',
-    active INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME
+CREATE TABLE IF NOT EXISTS subscriptions (
+    sub_id   SERIAL PRIMARY KEY,
+    sub_name VARCHAR(100) UNIQUE NOT NULL,
+    price    TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_api_key ON users(api_key);
-CREATE INDEX IF NOT EXISTS idx_active ON users(active);
+CREATE TABLE IF NOT EXISTS llm_models (
+    llm_model_id SERIAL PRIMARY KEY,
+    model_name   VARCHAR(200) NOT NULL,
+    upstream     VARCHAR(50)  NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quota_items (
+    quota_id          SERIAL PRIMARY KEY,
+    sub_id            INTEGER NOT NULL REFERENCES subscriptions(sub_id),
+    llm_model_id      INTEGER NOT NULL REFERENCES llm_models(llm_model_id),
+    percentage_weight INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id    VARCHAR(26)  PRIMARY KEY,
+    username   VARCHAR(200),
+    apitoken   VARCHAR(200) UNIQUE NOT NULL,
+    sub_id     INTEGER REFERENCES subscriptions(sub_id),
+    active     BOOLEAN   DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    expires_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS usage_logs (
+    usage_id      SERIAL PRIMARY KEY,
+    quota_item_id INTEGER NOT NULL REFERENCES quota_items(quota_id),
+    token_count   INTEGER DEFAULT 0,
+    timestamp     TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_apitoken    ON users(apitoken);
+CREATE INDEX IF NOT EXISTS idx_user_active ON users(active);
+CREATE INDEX IF NOT EXISTS idx_quota_sub   ON quota_items(sub_id);
+CREATE INDEX IF NOT EXISTS idx_usage_quota ON usage_logs(quota_item_id);
 `
 
-// New creates a new database connection and initializes the schema
-func New(path string) (*DB, error) {
-	// Ensure the directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create database directory: %w", err)
-	}
-
-	// Open SQLite connection
-	conn, err := sql.Open("sqlite", path)
+// New creates a new PostgreSQL database connection and initializes the schema
+func New(dsn string) (*DB, error) {
+	conn, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Test the connection
 	if err := conn.Ping(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Enable WAL mode for better concurrency
-	if _, err := conn.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
-	}
-
 	db := &DB{conn: conn}
 
-	// Initialize schema
-	if err := db.InitSchema(); err != nil {
+	if err := db.initSchema(); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -66,8 +77,7 @@ func New(path string) (*DB, error) {
 	return db, nil
 }
 
-// InitSchema creates the database tables if they don't exist
-func (db *DB) InitSchema() error {
+func (db *DB) initSchema() error {
 	if _, err := db.conn.Exec(schema); err != nil {
 		return fmt.Errorf("failed to initialize schema: %w", err)
 	}

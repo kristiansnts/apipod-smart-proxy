@@ -1,49 +1,64 @@
 package database
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 )
 
-// User represents a user with an API key
+// User represents a user with an API token and subscription plan
 type User struct {
-	ID        int64
-	APIKey    string
-	Name      string
-	Tier      string
+	ID        string
+	Username  string
+	APIToken  string
+	SubID     int64
+	SubName   string
 	Active    bool
 	CreatedAt time.Time
 	ExpiresAt *time.Time
 }
 
-// CreateUser inserts a new user into the database
-func (db *DB) CreateUser(name, apiKey, tier string, expiresAt *time.Time) (*User, error) {
+// newULID generates a new ULID using a cryptographically secure source
+func newULID() (string, error) {
+	id, err := ulid.New(ulid.Timestamp(time.Now()), rand.Reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate ULID: %w", err)
+	}
+	return id.String(), nil
+}
+
+// CreateUser inserts a new user into the database with a ULID primary key
+func (db *DB) CreateUser(username, apiToken string, subID int64, expiresAt *time.Time) (*User, error) {
+	userID, err := newULID()
+	if err != nil {
+		return nil, err
+	}
+
 	query := `
-		INSERT INTO users (api_key, name, tier, expires_at)
-		VALUES (?, ?, ?, ?)
-		RETURNING id, api_key, name, tier, active, created_at, expires_at
+		INSERT INTO users (user_id, username, apitoken, sub_id, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING user_id, username, apitoken, sub_id, active, created_at, expires_at
 	`
 
 	var user User
-	var active int
 	var expiresAtSQL sql.NullTime
 
-	err := db.conn.QueryRow(query, apiKey, name, tier, expiresAt).Scan(
+	err = db.conn.QueryRow(query, userID, username, apiToken, subID, expiresAt).Scan(
 		&user.ID,
-		&user.APIKey,
-		&user.Name,
-		&user.Tier,
-		&active,
+		&user.Username,
+		&user.APIToken,
+		&user.SubID,
+		&user.Active,
 		&user.CreatedAt,
 		&expiresAtSQL,
 	)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
-	user.Active = active == 1
 	if expiresAtSQL.Valid {
 		user.ExpiresAt = &expiresAtSQL.Time
 	}
@@ -51,36 +66,36 @@ func (db *DB) CreateUser(name, apiKey, tier string, expiresAt *time.Time) (*User
 	return &user, nil
 }
 
-// GetUserByAPIKey retrieves a user by their API key
-func (db *DB) GetUserByAPIKey(apiKey string) (*User, error) {
+// GetUserByAPIToken retrieves a user (with subscription name) by their API token
+func (db *DB) GetUserByAPIToken(apiToken string) (*User, error) {
 	query := `
-		SELECT id, api_key, name, tier, active, created_at, expires_at
-		FROM users
-		WHERE api_key = ?
+		SELECT u.user_id, u.username, u.apitoken, u.sub_id,
+		       COALESCE(s.sub_name, ''), u.active, u.created_at, u.expires_at
+		FROM users u
+		LEFT JOIN subscriptions s ON s.sub_id = u.sub_id
+		WHERE u.apitoken = $1
 	`
 
 	var user User
-	var active int
 	var expiresAtSQL sql.NullTime
 
-	err := db.conn.QueryRow(query, apiKey).Scan(
+	err := db.conn.QueryRow(query, apiToken).Scan(
 		&user.ID,
-		&user.APIKey,
-		&user.Name,
-		&user.Tier,
-		&active,
+		&user.Username,
+		&user.APIToken,
+		&user.SubID,
+		&user.SubName,
+		&user.Active,
 		&user.CreatedAt,
 		&expiresAtSQL,
 	)
-
 	if err == sql.ErrNoRows {
-		return nil, nil // User not found
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user: %w", err)
 	}
 
-	user.Active = active == 1
 	if expiresAtSQL.Valid {
 		user.ExpiresAt = &expiresAtSQL.Time
 	}
@@ -88,25 +103,20 @@ func (db *DB) GetUserByAPIKey(apiKey string) (*User, error) {
 	return &user, nil
 }
 
-// IsValidAPIKey checks if an API key is valid (exists, active, not expired)
-func (db *DB) IsValidAPIKey(apiKey string) (bool, *User, error) {
-	user, err := db.GetUserByAPIKey(apiKey)
+// IsValidAPIToken checks if an API token is valid (exists, active, not expired)
+func (db *DB) IsValidAPIToken(apiToken string) (bool, *User, error) {
+	user, err := db.GetUserByAPIToken(apiToken)
 	if err != nil {
 		return false, nil, err
 	}
 	if user == nil {
-		return false, nil, nil // Key doesn't exist
+		return false, nil, nil
 	}
-
-	// Check if user is active
 	if !user.Active {
 		return false, user, nil
 	}
-
-	// Check if key has expired
 	if user.ExpiresAt != nil && user.ExpiresAt.Before(time.Now()) {
 		return false, user, nil
 	}
-
 	return true, user, nil
 }

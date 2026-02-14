@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/config"
+	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
 )
 
@@ -17,15 +18,17 @@ import (
 type Handler struct {
 	config *config.Config
 	router *Router
+	db     *database.DB
 	client *http.Client
 	logger *log.Logger
 }
 
 // NewHandler creates a new proxy handler
-func NewHandler(cfg *config.Config, router *Router, logger *log.Logger) *Handler {
+func NewHandler(cfg *config.Config, router *Router, db *database.DB, logger *log.Logger) *Handler {
 	return &Handler{
 		config: cfg,
 		router: router,
+		db:     db,
 		client: &http.Client{
 			Timeout: 5 * time.Minute, // Long timeout for streaming
 		},
@@ -35,7 +38,6 @@ func NewHandler(cfg *config.Config, router *Router, logger *log.Logger) *Handler
 
 // HandleChatCompletion handles POST /v1/chat/completions
 func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
-	// Only accept POST
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
 		return
@@ -62,36 +64,35 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply smart routing
+	// Apply DB-driven smart routing based on user's subscription
 	originalModel := req.Model
-	routing := h.router.RouteModel(originalModel)
+	routing, err := h.router.RouteModel(user.SubID, originalModel)
+	if err != nil {
+		h.logger.Printf("Routing error for sub_id=%d: %v", user.SubID, err)
+		http.Error(w, `{"error": "Routing failed"}`, http.StatusInternalServerError)
+		return
+	}
 	req.Model = routing.Model
 
-	// Determine upstream URL and API key based on routing
+	// Determine upstream URL and API key
 	var upstreamURL, apiKey string
 	switch routing.Upstream {
 	case UpstreamGHCP:
 		upstreamURL = h.config.GHCPURL + "/v1/messages"
 		apiKey = h.config.GHCPKey
-	case UpstreamAntigravity:
-		upstreamURL = h.config.AntigravityURL + "/v1/messages"
-		apiKey = h.config.AntigravityKey
 	default:
 		upstreamURL = h.config.AntigravityURL + "/v1/messages"
 		apiKey = h.config.AntigravityKey
 	}
 
-	// Anthropic API requires max_tokens, set default if not provided
+	// Anthropic API requires max_tokens
 	if req.MaxTokens == nil {
 		defaultMaxTokens := 4096
 		req.MaxTokens = &defaultMaxTokens
 	}
 
-	// Log routing decision
-	if originalModel != routing.Model || routing.Upstream != UpstreamAntigravity {
-		h.logger.Printf("Smart routing: %s → %s via %s (user: %s, tier: %s)",
-			originalModel, routing.Model, routing.Upstream, user.Name, user.Tier)
-	}
+	h.logger.Printf("Routing: %s → %s via %s (user: %s, plan: %s)",
+		originalModel, routing.Model, routing.Upstream, user.Username, user.SubName)
 
 	// Re-encode modified request
 	modifiedBody, err := json.Marshal(req)
@@ -107,22 +108,21 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy headers from original request (except Authorization)
+	// Copy headers (except Authorization)
 	for key, values := range r.Header {
 		if key == "Authorization" {
-			continue // Don't forward user's API key
+			continue
 		}
 		for _, value := range values {
 			upstreamReq.Header.Add(key, value)
 		}
 	}
 
-	// Add upstream API key and required headers
 	upstreamReq.Header.Set("x-api-key", apiKey)
 	upstreamReq.Header.Set("Content-Type", "application/json")
 	upstreamReq.Header.Set("anthropic-version", "2023-06-01")
 
-	// Send request to upstream
+	// Send to upstream
 	upstreamResp, err := h.client.Do(upstreamReq)
 	if err != nil {
 		h.logger.Printf("Upstream request failed: %v", err)
@@ -138,66 +138,58 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check if this is a streaming response
 	isStreaming := req.Stream != nil && *req.Stream
 	contentType := upstreamResp.Header.Get("Content-Type")
 
-	// If upstream returns SSE, handle streaming
 	if isStreaming || contentType == "text/event-stream" {
-		h.handleStreamingResponse(w, upstreamResp)
+		h.handleStreamingResponse(w, upstreamResp, routing.QuotaItemID)
 	} else {
-		h.handleNonStreamingResponse(w, upstreamResp)
+		h.handleNonStreamingResponse(w, upstreamResp, routing.QuotaItemID)
 	}
 }
 
 // handleStreamingResponse handles Server-Sent Events (SSE) streaming
-func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response) {
-	// Check if ResponseWriter supports flushing
+func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response, quotaItemID int64) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, `{"error": "Streaming not supported"}`, http.StatusInternalServerError)
 		return
 	}
 
-	// Set streaming headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
-
-	// Write status code
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(upstreamResp.StatusCode)
 
-	// Create a ticker for periodic flushing
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	// Buffer for reading chunks
 	buf := make([]byte, 4096)
 	lastFlush := time.Now()
 
 	for {
-		// Read chunk from upstream
 		n, err := upstreamResp.Body.Read(buf)
 
 		if n > 0 {
-			// Write chunk to client
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				h.logger.Printf("Failed to write to client: %v", writeErr)
 				return
 			}
-
-			// Flush immediately if 100ms has passed since last flush
 			if time.Since(lastFlush) >= 100*time.Millisecond {
 				flusher.Flush()
 				lastFlush = time.Now()
 			}
 		}
 
-		// Check for errors
 		if err == io.EOF {
-			// End of stream, flush final data
 			flusher.Flush()
+			// Log usage with 0 tokens for streaming (token count unavailable)
+			if quotaItemID > 0 {
+				if logErr := h.db.LogUsage(quotaItemID, 0); logErr != nil {
+					h.logger.Printf("Failed to log usage: %v", logErr)
+				}
+			}
 			return
 		}
 
@@ -208,15 +200,41 @@ func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *h
 	}
 }
 
-// handleNonStreamingResponse handles regular JSON responses
-func (h *Handler) handleNonStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response) {
-	// Write status code
+// handleNonStreamingResponse handles regular JSON responses and logs token usage
+func (h *Handler) handleNonStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response, quotaItemID int64) {
 	w.WriteHeader(upstreamResp.StatusCode)
 
-	// Copy response body directly
-	if _, err := io.Copy(w, upstreamResp.Body); err != nil {
-		h.logger.Printf("Failed to copy response: %v", err)
+	respBytes, err := io.ReadAll(upstreamResp.Body)
+	if err != nil {
+		h.logger.Printf("Failed to read response: %v", err)
+		return
 	}
+
+	if _, err := w.Write(respBytes); err != nil {
+		h.logger.Printf("Failed to write response: %v", err)
+	}
+
+	// Extract token count and log usage
+	if quotaItemID > 0 && upstreamResp.StatusCode == http.StatusOK {
+		tokenCount := extractTokenCount(respBytes)
+		if logErr := h.db.LogUsage(quotaItemID, tokenCount); logErr != nil {
+			h.logger.Printf("Failed to log usage: %v", logErr)
+		}
+	}
+}
+
+// extractTokenCount parses input_tokens + output_tokens from an Anthropic response
+func extractTokenCount(body []byte) int {
+	var resp struct {
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0
+	}
+	return resp.Usage.InputTokens + resp.Usage.OutputTokens
 }
 
 // HealthCheck handles GET /health

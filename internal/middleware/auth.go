@@ -46,15 +46,15 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		// Validate API key
-		valid, user, err := m.db.IsValidAPIKey(apiKey)
+		// Validate API token
+		valid, user, err := m.db.IsValidAPIToken(apiKey)
 		if err != nil {
 			http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
 			return
 		}
 
 		if !valid || user == nil {
-			http.Error(w, `{"error": "Invalid or expired API key"}`, http.StatusForbidden)
+			http.Error(w, `{"error": "Invalid or expired API token"}`, http.StatusForbidden)
 			return
 		}
 

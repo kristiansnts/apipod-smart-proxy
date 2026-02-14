@@ -17,87 +17,88 @@ type Handler struct {
 
 // NewHandler creates a new admin handler
 func NewHandler(db *database.DB, secret string) *Handler {
-	return &Handler{
-		db:     db,
-		secret: secret,
-	}
+	return &Handler{db: db, secret: secret}
 }
 
-// CreateKeyRequest is the request body for creating an API key
+// CreateKeyRequest is the request body for creating an API token
 type CreateKeyRequest struct {
 	Name      string `json:"name"`
-	Tier      string `json:"tier,omitempty"`
+	SubName   string `json:"sub_name"`            // subscription plan name
 	ExpiresIn *int   `json:"expires_in,omitempty"` // days
 }
 
-// CreateKeyResponse is the response for API key creation
+// CreateKeyResponse is the response for API token creation
 type CreateKeyResponse struct {
-	APIKey    string     `json:"api_key"`
+	APIToken  string     `json:"api_token"`
 	Name      string     `json:"name"`
-	Tier      string     `json:"tier"`
+	SubName   string     `json:"sub_name"`
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // CreateAPIKey handles POST /admin/create-key
 func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
-	// Only accept POST
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Verify admin secret
-	adminSecret := r.Header.Get("x-admin-secret")
-	if adminSecret != h.secret {
+	if r.Header.Get("x-admin-secret") != h.secret {
 		http.Error(w, `{"error": "Invalid admin secret"}`, http.StatusForbidden)
 		return
 	}
 
-	// Parse request body
 	var req CreateKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Validate name
 	if req.Name == "" {
-		http.Error(w, `{"error": "Name is required"}`, http.StatusBadRequest)
+		http.Error(w, `{"error": "name is required"}`, http.StatusBadRequest)
+		return
+	}
+	if req.SubName == "" {
+		http.Error(w, `{"error": "sub_name is required (e.g. cursor-pro-sonnet)"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Set default tier
-	if req.Tier == "" {
-		req.Tier = "elite"
-	}
-
-	// Generate API key
-	apiKey, err := keygen.GenerateAPIKey()
+	// Resolve subscription
+	sub, err := h.db.GetSubscriptionByName(req.SubName)
 	if err != nil {
-		http.Error(w, `{"error": "Failed to generate API key"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+	if sub == nil {
+		http.Error(w, `{"error": "Unknown subscription plan"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Calculate expiration date
+	// Generate API token
+	apiToken, err := keygen.GenerateAPIKey()
+	if err != nil {
+		http.Error(w, `{"error": "Failed to generate API token"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Calculate expiration
 	var expiresAt *time.Time
 	if req.ExpiresIn != nil && *req.ExpiresIn > 0 {
 		expiry := time.Now().AddDate(0, 0, *req.ExpiresIn)
 		expiresAt = &expiry
 	}
 
-	// Create user in database
-	user, err := h.db.CreateUser(req.Name, apiKey, req.Tier, expiresAt)
+	// Create user
+	user, err := h.db.CreateUser(req.Name, apiToken, sub.SubID, expiresAt)
 	if err != nil {
 		http.Error(w, `{"error": "Failed to create user"}`, http.StatusInternalServerError)
 		return
 	}
 
-	// Return response
 	resp := CreateKeyResponse{
-		APIKey:    user.APIKey,
-		Name:      user.Name,
-		Tier:      user.Tier,
+		APIToken:  user.APIToken,
+		Name:      user.Username,
+		SubName:   sub.SubName,
 		CreatedAt: user.CreatedAt,
 		ExpiresAt: user.ExpiresAt,
 	}

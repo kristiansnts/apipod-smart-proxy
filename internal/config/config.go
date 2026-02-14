@@ -15,7 +15,7 @@ type Config struct {
 	GHCPKey        string
 	AdminSecret    string
 	Port           string
-	DatabasePath   string
+	DatabaseURL    string
 }
 
 // Load reads configuration from environment variables
@@ -29,9 +29,9 @@ func Load() (*Config, error) {
 		AntigravityKey: os.Getenv("ANTIGRAVITY_KEY"),
 		GHCPURL:        getEnv("GHCP_URL", "http://127.0.0.1:8317/api/provider/ghcp"),
 		GHCPKey:        getEnv("GHCP_KEY", "ccs-internal-managed"),
-		AdminSecret:    os.Getenv("ADMIN_SECRET"),
-		Port:           getEnv("PORT", "8081"),
-		DatabasePath:   getEnv("DATABASE_PATH", "./data/proxy.db"),
+		AdminSecret: os.Getenv("ADMIN_SECRET"),
+		Port:        getEnv("PORT", "8081"),
+		DatabaseURL: getEnv("DATABASE_URL", "postgres://local:local@127.0.0.1/apipod?sslmode=disable"),
 	}
 
 	// Validate required fields
@@ -55,6 +55,9 @@ func (c *Config) Validate() error {
 	}
 	if len(c.AdminSecret) < 16 {
 		return fmt.Errorf("ADMIN_SECRET must be at least 16 characters for security")
+	}
+	if c.DatabaseURL == "" {
+		return fmt.Errorf("DATABASE_URL is required but not set")
 	}
 	return nil
 }
