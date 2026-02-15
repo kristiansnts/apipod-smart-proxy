@@ -17,23 +17,24 @@ type RoutingResult struct {
 	QuotaItemID  int64
 }
 
-// Router handles DB-driven weighted model routing
+// Router handles DB-driven weighted model routing with RPM awareness
 type Router struct {
-	db   *database.DB
-	rand *rand.Rand
+	db          *database.DB
+	rand        *rand.Rand
+	rateLimiter *RateLimiter
 }
 
 // NewRouter creates a new smart router backed by the database
 func NewRouter(db *database.DB) *Router {
 	src := rand.NewSource(time.Now().UnixNano())
 	return &Router{
-		db:   db,
-		rand: rand.New(src),
+		db:          db,
+		rand:        rand.New(src),
+		rateLimiter: NewRateLimiter(),
 	}
 }
 
-// RouteModel selects a model/upstream for the given subscription using weighted random selection.
-// Returns the routing result (model, upstream details, quota_item_id).
+// RouteModel selects a model/upstream for the given subscription using weighted random selection with RPM failover.
 func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, error) {
 	items, err := r.db.GetQuotaItemsBySubID(subID)
 	if err != nil {
@@ -44,38 +45,62 @@ func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, e
 		return RoutingResult{}, fmt.Errorf("no quota items configured for sub_id=%d", subID)
 	}
 
-	// Weighted random selection
-	totalWeight := 0
-	for _, item := range items {
-		totalWeight += item.PercentageWeight
-	}
+	// Algorithm: 
+	// 1. Sort available items by weight (highest first)
+	// 2. Try items in order. If RPM limit reached, try the next one.
+	
+	// Copy and shuffle/sort based on weights for "Smooth Weighted" feel
+	// For simplicity in this iteration, we use Weighted Random selection but with multiple attempts.
+	
+	remainingItems := make([]database.QuotaItem, len(items))
+	copy(remainingItems, items)
 
-	if totalWeight <= 0 {
-		return RoutingResult{}, fmt.Errorf("total weight must be greater than 0 for sub_id=%d", subID)
-	}
-
-	roll := r.rand.Intn(totalWeight)
-	cumulative := 0
-	for _, item := range items {
-		cumulative += item.PercentageWeight
-		if roll < cumulative {
-			return RoutingResult{
-				Model:        item.ModelName,
-				BaseURL:      item.BaseURL,
-				APIKey:       item.APIKey,
-				ProviderType: item.ProviderType,
-				QuotaItemID:  item.QuotaID,
-			}, nil
+	for len(remainingItems) > 0 {
+		totalWeight := 0
+		for _, item := range remainingItems {
+			totalWeight += item.PercentageWeight
 		}
+
+		if totalWeight <= 0 {
+			// If all remaining have 0 weight, pick first available that isn't rate limited
+			for _, item := range remainingItems {
+				if r.rateLimiter.Allow(item.QuotaID, item.RPMLimit) {
+					return r.toResult(item), nil
+				}
+			}
+			break
+		}
+
+		roll := r.rand.Intn(totalWeight)
+		cumulative := 0
+		selectedIndex := -1
+		
+		for i, item := range remainingItems {
+			cumulative += item.PercentageWeight
+			if roll < cumulative {
+				selectedIndex = i
+				break
+			}
+		}
+
+		selected := remainingItems[selectedIndex]
+		if r.rateLimiter.Allow(selected.QuotaID, selected.RPMLimit) {
+			return r.toResult(selected), nil
+		}
+
+		// If rate limited, remove this item and try again
+		remainingItems = append(remainingItems[:selectedIndex], remainingItems[selectedIndex+1:]...)
 	}
 
-	// Fallback
-	last := items[len(items)-1]
+	return RoutingResult{}, fmt.Errorf("all configured models reached RPM limit for sub_id=%d", subID)
+}
+
+func (r *Router) toResult(item database.QuotaItem) RoutingResult {
 	return RoutingResult{
-		Model:        last.ModelName,
-		BaseURL:      last.BaseURL,
-		APIKey:       last.APIKey,
-		ProviderType: last.ProviderType,
-		QuotaItemID:  last.QuotaID,
-	}, nil
+		Model:        item.ModelName,
+		BaseURL:      item.BaseURL,
+		APIKey:       item.APIKey,
+		ProviderType: item.ProviderType,
+		QuotaItemID:  item.QuotaID,
+	}
 }
