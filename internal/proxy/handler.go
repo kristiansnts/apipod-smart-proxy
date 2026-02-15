@@ -65,34 +65,20 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply DB-driven smart routing based on user's subscription
-	originalModel := req.Model
-	routing, err := h.router.RouteModel(user.SubID, originalModel)
+	routing, err := h.router.RouteModel(user.SubID, req.Model)
 	if err != nil {
 		h.logger.Printf("Routing error for sub_id=%d: %v", user.SubID, err)
-		http.Error(w, `{"error": "Routing failed"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error": "Routing failed or no models configured"}`, http.StatusInternalServerError)
 		return
 	}
 	req.Model = routing.Model
 
-	// Determine upstream URL and API key
-	var upstreamURL, apiKey string
-	switch routing.Upstream {
-	case UpstreamGHCP:
-		upstreamURL = h.config.GHCPURL + "/v1/messages"
-		apiKey = h.config.GHCPKey
-	default:
-		upstreamURL = h.config.AntigravityURL + "/v1/messages"
-		apiKey = h.config.AntigravityKey
-	}
-
-	// Anthropic API requires max_tokens
-	if req.MaxTokens == nil {
-		defaultMaxTokens := 4096
-		req.MaxTokens = &defaultMaxTokens
-	}
+	// Determine upstream URL and API key dynamically from DB
+	upstreamURL := routing.BaseURL + "/v1/messages"
+	apiKey := routing.APIKey
 
 	h.logger.Printf("Routing: %s → %s via %s (user: %s, plan: %s)",
-		originalModel, routing.Model, routing.Upstream, user.Username, user.SubName)
+		originalModel, routing.Model, routing.BaseURL, user.Username, user.SubName)
 
 	// Re-encode modified request
 	modifiedBody, err := json.Marshal(req)
@@ -108,9 +94,9 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy headers (except Authorization)
+	// Copy headers (except Authorization and restricted ones)
 	for key, values := range r.Header {
-		if key == "Authorization" {
+		if key == "Authorization" || key == "Content-Type" || key == "x-api-key" {
 			continue
 		}
 		for _, value := range values {
@@ -120,7 +106,11 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	upstreamReq.Header.Set("x-api-key", apiKey)
 	upstreamReq.Header.Set("Content-Type", "application/json")
-	upstreamReq.Header.Set("anthropic-version", "2023-06-01")
+
+	// Add provider-specific headers
+	if routing.ProviderType == "anthropic" {
+		upstreamReq.Header.Set("anthropic-version", "2023-06-01")
+	}
 
 	// Send to upstream
 	upstreamResp, err := h.client.Do(upstreamReq)

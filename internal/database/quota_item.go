@@ -10,15 +10,20 @@ type QuotaItem struct {
 	ModelName        string
 	Upstream         string
 	PercentageWeight int
+	BaseURL          string
+	APIKey           string
+	ProviderType     string
 }
 
-// GetQuotaItemsBySubID loads all quota items (with model info) for a subscription
+// GetQuotaItemsBySubID loads all quota items (with model and provider info) for a subscription
 func (db *DB) GetQuotaItemsBySubID(subID int64) ([]QuotaItem, error) {
 	query := `
 		SELECT qi.quota_id, qi.sub_id, qi.llm_model_id,
-		       m.model_name, m.upstream, qi.percentage_weight
+		       m.model_name, COALESCE(m.upstream, ''), qi.percentage_weight,
+		       p.base_url, p.api_key, p.provider_type
 		FROM quota_items qi
 		JOIN llm_models m ON m.llm_model_id = qi.llm_model_id
+		JOIN providers p ON p.id = m.provider_id
 		WHERE qi.sub_id = $1
 	`
 
@@ -34,6 +39,7 @@ func (db *DB) GetQuotaItemsBySubID(subID int64) ([]QuotaItem, error) {
 		if err := rows.Scan(
 			&qi.QuotaID, &qi.SubID, &qi.LLMModelID,
 			&qi.ModelName, &qi.Upstream, &qi.PercentageWeight,
+			&qi.BaseURL, &qi.APIKey, &qi.ProviderType,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan quota item: %w", err)
 		}
