@@ -29,13 +29,16 @@ func ProxyToGoogle(accessToken string, model string, body []byte, stream bool) (
 		return nil, err
 	}
 
-	// FINGERPRINT HEADERS (Meniru Google Cloud Code Extension)
+	// FINGERPRINT HEADERS (Identik dengan Badri / VS Code Extension)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Code/1.92.2 Chrome/124.0.6367.243 Electron/30.4.0 Safari/537.36")
 	req.Header.Set("x-goog-api-client", "gl-js/ env/vscode/1.92.2")
 	req.Header.Set("x-goog-user-project", "antigravity")
+	req.Header.Set("x-goog-api-version", "v1")
 	req.Header.Set("Referer", "vscode-webview://")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	
 	// Default client with TLS config
 	// Catatan: Karena 'go' binary tidak tersedia di PATH sandbox saat ini, 

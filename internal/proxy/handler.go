@@ -15,6 +15,51 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/antigravity"
 )
 
+var (
+	antigravityPools   = make(map[uint]*antigravity.AccountPool)
+	antigravityPoolsMu sync.RWMutex
+)
+
+func (h *Handler) getAntigravityPool(providerID uint) (*antigravity.AccountPool, error) {
+	antigravityPoolsMu.RLock()
+	pool, exists := antigravityPools[providerID]
+	antigravityPoolsMu.RUnlock()
+
+	if exists {
+		return pool, nil
+	}
+
+	antigravityPoolsMu.Lock()
+	defer antigravityPoolsMu.Unlock()
+
+	// Double check
+	if pool, exists := antigravityPools[providerID]; exists {
+		return pool, nil
+	}
+
+	// Load from DB
+	dbAccounts, err := h.db.GetActiveAccountsForProvider(providerID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Dynamic Pool: Logic now handled inside GetReadyAccount based on per-account limits
+	newPool := antigravity.NewAccountPool()
+	for _, dbAcc := range dbAccounts {
+		newPool.Accounts = append(newPool.Accounts, &antigravity.Account{
+			ID:           dbAcc.ID,
+			Email:        dbAcc.Email,
+			RefreshToken: dbAcc.APIKey,
+			LimitType:    dbAcc.LimitType,
+			LimitValue:   dbAcc.LimitValue,
+			LastUsedAt:   dbAcc.LastUsedAt,
+		})
+	}
+
+	antigravityPools[providerID] = newPool
+	return newPool, nil
+}
+
 // Handler handles proxy requests
 type Handler struct {
 	config *config.Config
