@@ -2,7 +2,6 @@ package antigravity
 
 import (
 	"encoding/json"
-	"fmt"
 )
 
 // Anthropic Request

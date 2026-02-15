@@ -1,9 +1,5 @@
 package copilot
 
-import (
-	"encoding/json"
-	"fmt"
-)
 
 // Simple transform for Copilot (usually OpenAI compatible but with GHP token)
 func TransformToCopilot(body []byte) ([]byte, error) {

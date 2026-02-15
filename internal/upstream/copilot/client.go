@@ -1,8 +1,6 @@
 package copilot
 
 import (
-	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"

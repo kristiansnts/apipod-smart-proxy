@@ -12,7 +12,6 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
-	"github.com/rpay/apipod-smart-proxy/internal/upstream/antigravity"
 )
 
 // Handler handles proxy requests

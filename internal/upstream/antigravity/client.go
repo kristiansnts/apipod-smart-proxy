@@ -2,13 +2,55 @@ package antigravity
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
+
+// Google OAuth2 Client ID for Cloud Code extension
+const googleClientID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
+const googleClientSecret = "d-FL95Q19q7MQmFpd7hHD0Ty"
+
+// ExchangeRefreshToken exchanges a Google OAuth2 refresh token for an access token
+func ExchangeRefreshToken(refreshToken string) (string, error) {
+	data := url.Values{}
+	data.Set("client_id", googleClientID)
+	data.Set("client_secret", googleClientSecret)
+	data.Set("refresh_token", refreshToken)
+	data.Set("grant_type", "refresh_token")
+
+	req, err := http.NewRequest("POST", "https://oauth2.googleapis.com/token", strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return "", err
+	}
+
+	if tokenResp.Error != "" {
+		return "", fmt.Errorf("oauth error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+	}
+
+	return tokenResp.AccessToken, nil
+}
 
 // ProxyToGoogle sends the transformed request to Antigravity's Google API with "Fingerprint" headers
 func ProxyToGoogle(accessToken string, model string, body []byte, stream bool) (*http.Response, error) {
