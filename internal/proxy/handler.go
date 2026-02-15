@@ -74,11 +74,17 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	req.Model = routing.Model
 
 	// Determine upstream URL and API key dynamically from DB
-	upstreamURL := routing.BaseURL + "/v1/messages"
+	var upstreamURL string
+	if routing.ProviderType == "openai" {
+		upstreamURL = routing.BaseURL + "/v1/chat/completions"
+	} else {
+		// Default to Anthropic format
+		upstreamURL = routing.BaseURL + "/v1/messages"
+	}
 	apiKey := routing.APIKey
 
-	h.logger.Printf("Routing: %s → %s via %s (user: %s, plan: %s)",
-		originalModel, routing.Model, routing.BaseURL, user.Username, user.SubName)
+	h.logger.Printf("Routing: %s → %s via %s (Type: %s, User: %s)",
+		originalModel, routing.Model, routing.BaseURL, routing.ProviderType, user.Username)
 
 	// Re-encode modified request
 	modifiedBody, err := json.Marshal(req)
