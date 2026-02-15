@@ -43,7 +43,9 @@ func (h *Handler) getAntigravityPool(providerID uint) (*antigravity.AccountPool,
 		return nil, err
 	}
 
-	newPool := antigravity.NewAccountPool(3 * time.Second) // 3s cooldown
+	// Dynamic Pool: Cooldown calculated based on routing's RPMLimit
+	// We'll pass the RPM from routing result
+	newPool := antigravity.NewAccountPool(h.router.GetRPMLimit(providerID)) 
 	for _, dbAcc := range dbAccounts {
 		newPool.Accounts = append(newPool.Accounts, &antigravity.Account{
 			ID:           dbAcc.ID,
