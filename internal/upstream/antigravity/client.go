@@ -1,63 +1,108 @@
 package antigravity
 
 import (
-	"crypto/tls"
-	"fmt"
+	"bytes"
+	"encoding/json"
 	"io"
-	"net"
 	"net/http"
-	"strings"
 	"time"
+	"fmt"
 )
 
-// ProxyToGoogle sends the transformed request to Antigravity's Google API with "Fingerprint" headers
+var transport = &http.Transport{
+	MaxIdleConns:        500,
+	MaxIdleConnsPerHost: 100,
+	IdleConnTimeout:     120 * time.Second,
+}
+
+func ExchangeRefreshToken(refreshToken string) (string, error) {
+	return "internal-managed", nil
+}
+
 func ProxyToGoogle(accessToken string, model string, body []byte, stream bool) (*http.Response, error) {
-	action := "generateContent"
-	if stream {
-		action = "streamGenerateContent"
+	var openAIReq struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	json.Unmarshal(body, &openAIReq)
+
+	// Translate OpenAI "Content String" to Anthropic "Content Array" (THE FIX)
+	anthropicMessages := make([]map[string]interface{}, 0)
+	for _, m := range openAIReq.Messages {
+		msg := map[string]interface{}{
+			"role": m.Role,
+			"content": []map[string]interface{}{
+				{
+					"type": "text",
+					"text": m.Content,
+				},
+			},
+		}
+		anthropicMessages = append(anthropicMessages, msg)
 	}
 
-	googleModel := model
-	if !strings.Contains(googleModel, "publishers/") {
-		googleModel = fmt.Sprintf("publishers/google/models/%s", model)
+	upstreamReq := map[string]interface{}{
+		"model":             model,
+		"messages":          anthropicMessages,
+		"max_tokens":        4096,
+		"stream":            stream,
 	}
 
-	apiURL := fmt.Sprintf("https://daily-cloudcode-pa.sandbox.googleapis.com/v1/projects/antigravity/locations/global/%s:%s", googleModel, action)
+	finalBody, _ := json.Marshal(upstreamReq)
+	apiURL := "http://localhost:8080/v1/messages"
 	
-	req, err := http.NewRequest("POST", apiURL, strings.NewReader(string(body)))
+	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(finalBody))
 	if err != nil {
 		return nil, err
 	}
 
-	// FINGERPRINT HEADERS (Identik dengan Badri / VS Code Extension)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Code/1.92.2 Chrome/124.0.6367.243 Electron/30.4.0 Safari/537.36")
-	req.Header.Set("x-goog-api-client", "gl-js/ env/vscode/1.92.2")
-	req.Header.Set("x-goog-user-project", "antigravity")
-	req.Header.Set("x-goog-api-version", "v1")
-	req.Header.Set("Referer", "vscode-webview://")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	
-	// Default client with TLS config
-	// Catatan: Karena 'go' binary tidak tersedia di PATH sandbox saat ini, 
-	// saya menggunakan standard library dengan TLS 1.3 yang sangat mirip dengan Chrome.
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS13,
-			CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
-		},
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{Transport: transport, Timeout: 2 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
 	}
 
-	client := &http.Client{
-		Transport: tr,
-		Timeout:   5 * time.Minute,
+	// Translation Layer: Badri -> OpenAI (So Cursor/UI works)
+	if !stream && resp.StatusCode == 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		var anthropicResp struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+			ID string `json:"id"`
+		}
+		
+		if err := json.Unmarshal(respBody, &anthropicResp); err == nil && len(anthropicResp.Content) > 0 {
+			openAIResp := map[string]interface{}{
+				"id":      anthropicResp.ID,
+				"object":  "chat.completion",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"message": map[string]interface{}{
+							"role":    "assistant",
+							"content": anthropicResp.Content[0].Text,
+						},
+						"finish_reason": "stop",
+						"index":         0,
+					},
+				},
+			}
+			newBody, _ := json.Marshal(openAIResp)
+			resp.Body = io.NopCloser(bytes.NewReader(newBody))
+			resp.ContentLength = int64(len(newBody))
+			resp.Header.Set("Content-Length", fmt.Sprint(len(newBody)))
+			resp.Header.Set("Content-Type", "application/json")
+		} else {
+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		}
 	}
-	
-	return client.Do(req)
+
+	return resp, nil
 }
