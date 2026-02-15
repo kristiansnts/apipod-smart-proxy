@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS usage_logs (
     usage_id      SERIAL PRIMARY KEY,
     quota_item_id INTEGER NOT NULL REFERENCES quota_items(quota_id),
     token_count   INTEGER DEFAULT 0,
+    input_tokens  INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
     timestamp     TIMESTAMP DEFAULT NOW()
 );
 

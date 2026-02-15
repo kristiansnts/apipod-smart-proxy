@@ -182,7 +182,7 @@ func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *h
 			flusher.Flush()
 			// Log usage with 0 tokens for streaming (token count unavailable)
 			if quotaItemID > 0 {
-				if logErr := h.db.LogUsage(quotaItemID, 0); logErr != nil {
+				if logErr := h.db.LogUsage(quotaItemID, 0, 0); logErr != nil {
 					h.logger.Printf("Failed to log usage: %v", logErr)
 				}
 			}
@@ -212,25 +212,38 @@ func (h *Handler) handleNonStreamingResponse(w http.ResponseWriter, upstreamResp
 
 	// Extract token count and log usage
 	if quotaItemID > 0 && upstreamResp.StatusCode == http.StatusOK {
-		tokenCount := extractTokenCount(respBytes)
-		if logErr := h.db.LogUsage(quotaItemID, tokenCount); logErr != nil {
+		inputTokens, outputTokens := extractTokenCounts(respBytes)
+		if logErr := h.db.LogUsage(quotaItemID, inputTokens, outputTokens); logErr != nil {
 			h.logger.Printf("Failed to log usage: %v", logErr)
 		}
 	}
 }
 
-// extractTokenCount parses input_tokens + output_tokens from an Anthropic response
-func extractTokenCount(body []byte) int {
-	var resp struct {
+// extractTokenCounts parses input_tokens + output_tokens from an Anthropic or OpenAI response
+func extractTokenCounts(body []byte) (int, int) {
+	// Try OpenAI format first
+	var oaResp struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &oaResp); err == nil && oaResp.Usage.PromptTokens > 0 {
+		return oaResp.Usage.PromptTokens, oaResp.Usage.CompletionTokens
+	}
+
+	// Try Anthropic format
+	var antResp struct {
 		Usage struct {
 			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0
+	if err := json.Unmarshal(body, &antResp); err == nil {
+		return antResp.Usage.InputTokens, antResp.Usage.OutputTokens
 	}
-	return resp.Usage.InputTokens + resp.Usage.OutputTokens
+
+	return 0, 0
 }
 
 // HealthCheck handles GET /health
