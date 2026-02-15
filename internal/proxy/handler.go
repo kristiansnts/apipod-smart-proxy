@@ -43,14 +43,16 @@ func (h *Handler) getAntigravityPool(providerID uint) (*antigravity.AccountPool,
 		return nil, err
 	}
 
-	// Dynamic Pool: Cooldown calculated based on routing's RPMLimit
-	// We'll pass the RPM from routing result
-	newPool := antigravity.NewAccountPool(h.router.GetRPMLimit(providerID)) 
+	// Dynamic Pool: Logic now handled inside GetReadyAccount based on per-account limits
+	newPool := antigravity.NewAccountPool()
 	for _, dbAcc := range dbAccounts {
 		newPool.Accounts = append(newPool.Accounts, &antigravity.Account{
 			ID:           dbAcc.ID,
 			Email:        dbAcc.Email,
 			RefreshToken: dbAcc.APIKey,
+			LimitType:    dbAcc.LimitType,
+			LimitValue:   dbAcc.LimitValue,
+			LastUsedAt:   dbAcc.LastUsedAt,
 		})
 	}
 
