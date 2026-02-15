@@ -12,6 +12,7 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
+	"github.com/rpay/apipod-smart-proxy/internal/upstream/antigravity"
 )
 
 // Handler handles proxy requests
@@ -76,16 +77,31 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	// Determine upstream URL and API key dynamically from DB
 	var upstreamURL string
-	if routing.ProviderType == "openai" {
+	var isNative bool
+	
+	switch routing.ProviderType {
+	case "openai":
 		upstreamURL = routing.BaseURL + "/v1/chat/completions"
-	} else {
+	case "antigravity_native":
+		isNative = true
+		// Logic will be handled below
+	case "copilot_native":
+		isNative = true
+		// Logic will be handled below
+	default:
 		// Default to Anthropic format
 		upstreamURL = routing.BaseURL + "/v1/messages"
 	}
+	
 	apiKey := routing.APIKey
 
-	h.logger.Printf("Routing: %s → %s via %s (Type: %s, User: %s)",
-		originalModel, routing.Model, routing.BaseURL, routing.ProviderType, user.Username)
+	h.logger.Printf("Routing: %s -> %s via %s (Type: %s, Native: %v)",
+		originalModel, routing.Model, routing.BaseURL, routing.ProviderType, isNative)
+
+	if isNative {
+		h.handleNativeUpstream(w, r, routing, user, originalModel, bodyBytes)
+		return
+	}
 
 	// Re-encode modified request
 	modifiedBody, err := json.Marshal(req)
