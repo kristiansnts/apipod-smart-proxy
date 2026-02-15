@@ -8,19 +8,13 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 )
 
-// UpstreamTarget represents which upstream to use
-type UpstreamTarget string
-
-const (
-	UpstreamAntigravity UpstreamTarget = "antigravity"
-	UpstreamGHCP        UpstreamTarget = "ghcp"
-)
-
-// RoutingResult contains the routed model, target upstream, and quota item ID for logging
+// RoutingResult contains the routed model, target upstream details, and quota item ID for logging
 type RoutingResult struct {
-	Model       string
-	Upstream    UpstreamTarget
-	QuotaItemID int64
+	Model        string
+	BaseURL      string
+	APIKey       string
+	ProviderType string
+	QuotaItemID  int64
 }
 
 // Router handles DB-driven weighted model routing
@@ -39,8 +33,7 @@ func NewRouter(db *database.DB) *Router {
 }
 
 // RouteModel selects a model/upstream for the given subscription using weighted random selection.
-// Returns the routing result (model, upstream, quota_item_id).
-// If the subscription has no quota items, falls back to Antigravity with the original model name.
+// Returns the routing result (model, upstream details, quota_item_id).
 func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, error) {
 	items, err := r.db.GetQuotaItemsBySubID(subID)
 	if err != nil {
@@ -48,11 +41,7 @@ func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, e
 	}
 
 	if len(items) == 0 {
-		// No quota items configured — pass through unchanged
-		return RoutingResult{
-			Model:    fallbackModel,
-			Upstream: UpstreamAntigravity,
-		}, nil
+		return RoutingResult{}, fmt.Errorf("no quota items configured for sub_id=%d", subID)
 	}
 
 	// Weighted random selection
@@ -61,24 +50,32 @@ func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, e
 		totalWeight += item.PercentageWeight
 	}
 
+	if totalWeight <= 0 {
+		return RoutingResult{}, fmt.Errorf("total weight must be greater than 0 for sub_id=%d", subID)
+	}
+
 	roll := r.rand.Intn(totalWeight)
 	cumulative := 0
 	for _, item := range items {
 		cumulative += item.PercentageWeight
 		if roll < cumulative {
 			return RoutingResult{
-				Model:       item.ModelName,
-				Upstream:    UpstreamTarget(item.Upstream),
-				QuotaItemID: item.QuotaID,
+				Model:        item.ModelName,
+				BaseURL:      item.BaseURL,
+				APIKey:       item.APIKey,
+				ProviderType: item.ProviderType,
+				QuotaItemID:  item.QuotaID,
 			}, nil
 		}
 	}
 
-	// Fallback (should never reach here)
+	// Fallback
 	last := items[len(items)-1]
 	return RoutingResult{
-		Model:       last.ModelName,
-		Upstream:    UpstreamTarget(last.Upstream),
-		QuotaItemID: last.QuotaID,
+		Model:        last.ModelName,
+		BaseURL:      last.BaseURL,
+		APIKey:       last.APIKey,
+		ProviderType: last.ProviderType,
+		QuotaItemID:  last.QuotaID,
 	}, nil
 }
