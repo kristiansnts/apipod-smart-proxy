@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strings"
 
@@ -15,12 +16,13 @@ const userContextKey contextKey = "user"
 
 // AuthMiddleware handles API key authentication
 type AuthMiddleware struct {
-	db *database.DB
+	db     *database.DB
+	logger *log.Logger
 }
 
 // NewAuthMiddleware creates a new authentication middleware
 func NewAuthMiddleware(db *database.DB) *AuthMiddleware {
-	return &AuthMiddleware{db: db}
+	return &AuthMiddleware{db: db, logger: log.Default()}
 }
 
 // Authenticate wraps an HTTP handler with API key authentication
@@ -49,6 +51,7 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		// Validate API token
 		valid, user, err := m.db.IsValidAPIToken(apiKey)
 		if err != nil {
+			m.logger.Printf("Auth error for token %s...: %v", apiKey[:min(8, len(apiKey))], err)
 			http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
 			return
 		}

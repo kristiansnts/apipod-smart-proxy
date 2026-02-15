@@ -1,12 +1,9 @@
 package database
 
 import (
-	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"time"
-
-	"github.com/oklog/ulid/v2"
 )
 
 // User represents a user with an API token and subscription plan
@@ -21,32 +18,18 @@ type User struct {
 	ExpiresAt *time.Time
 }
 
-// newULID generates a new ULID using a cryptographically secure source
-func newULID() (string, error) {
-	id, err := ulid.New(ulid.Timestamp(time.Now()), rand.Reader)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate ULID: %w", err)
-	}
-	return id.String(), nil
-}
-
 // CreateUser inserts a new user into the database with a ULID primary key
 func (db *DB) CreateUser(username, apiToken string, subID int64, expiresAt *time.Time) (*User, error) {
-	userID, err := newULID()
-	if err != nil {
-		return nil, err
-	}
-
 	query := `
-		INSERT INTO users (user_id, username, apitoken, sub_id, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING user_id, username, apitoken, sub_id, active, created_at, expires_at
+		INSERT INTO users (name, apitoken, sub_id, expires_at)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id::text, name, apitoken, sub_id, active, created_at, expires_at
 	`
 
 	var user User
 	var expiresAtSQL sql.NullTime
 
-	err = db.conn.QueryRow(query, userID, username, apiToken, subID, expiresAt).Scan(
+	err := db.conn.QueryRow(query, username, apiToken, subID, expiresAt).Scan(
 		&user.ID,
 		&user.Username,
 		&user.APIToken,
@@ -69,7 +52,7 @@ func (db *DB) CreateUser(username, apiToken string, subID int64, expiresAt *time
 // GetUserByAPIToken retrieves a user (with subscription name) by their API token
 func (db *DB) GetUserByAPIToken(apiToken string) (*User, error) {
 	query := `
-		SELECT u.user_id, u.username, u.apitoken, u.sub_id,
+		SELECT u.id::text, u.name, u.apitoken, u.sub_id,
 		       COALESCE(s.sub_name, ''), u.active, u.created_at, u.expires_at
 		FROM users u
 		LEFT JOIN subscriptions s ON s.sub_id = u.sub_id

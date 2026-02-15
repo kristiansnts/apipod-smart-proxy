@@ -71,6 +71,7 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error": "Routing failed or no models configured"}`, http.StatusInternalServerError)
 		return
 	}
+	originalModel := req.Model
 	req.Model = routing.Model
 
 	// Determine upstream URL and API key dynamically from DB
@@ -137,15 +138,23 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	isStreaming := req.Stream != nil && *req.Stream
 	contentType := upstreamResp.Header.Get("Content-Type")
 
+	usageCtx := database.UsageContext{
+		QuotaItemID:      routing.QuotaItemID,
+		UserID:           user.ID,
+		RequestedModel:   originalModel,
+		RoutedModel:      routing.Model,
+		UpstreamProvider: routing.BaseURL,
+	}
+
 	if isStreaming || contentType == "text/event-stream" {
-		h.handleStreamingResponse(w, upstreamResp, routing.QuotaItemID)
+		h.handleStreamingResponse(w, upstreamResp, usageCtx)
 	} else {
-		h.handleNonStreamingResponse(w, upstreamResp, routing.QuotaItemID)
+		h.handleNonStreamingResponse(w, upstreamResp, usageCtx)
 	}
 }
 
 // handleStreamingResponse handles Server-Sent Events (SSE) streaming
-func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response, quotaItemID int64) {
+func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response, usageCtx database.UsageContext) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, `{"error": "Streaming not supported"}`, http.StatusInternalServerError)
@@ -181,8 +190,8 @@ func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *h
 		if err == io.EOF {
 			flusher.Flush()
 			// Log usage with 0 tokens for streaming (token count unavailable)
-			if quotaItemID > 0 {
-				if logErr := h.db.LogUsage(quotaItemID, 0, 0); logErr != nil {
+			if usageCtx.QuotaItemID > 0 {
+				if logErr := h.db.LogUsage(usageCtx, 0, 0); logErr != nil {
 					h.logger.Printf("Failed to log usage: %v", logErr)
 				}
 			}
@@ -197,7 +206,7 @@ func (h *Handler) handleStreamingResponse(w http.ResponseWriter, upstreamResp *h
 }
 
 // handleNonStreamingResponse handles regular JSON responses and logs token usage
-func (h *Handler) handleNonStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response, quotaItemID int64) {
+func (h *Handler) handleNonStreamingResponse(w http.ResponseWriter, upstreamResp *http.Response, usageCtx database.UsageContext) {
 	w.WriteHeader(upstreamResp.StatusCode)
 
 	respBytes, err := io.ReadAll(upstreamResp.Body)
@@ -211,9 +220,9 @@ func (h *Handler) handleNonStreamingResponse(w http.ResponseWriter, upstreamResp
 	}
 
 	// Extract token count and log usage
-	if quotaItemID > 0 && upstreamResp.StatusCode == http.StatusOK {
+	if usageCtx.QuotaItemID > 0 && upstreamResp.StatusCode == http.StatusOK {
 		inputTokens, outputTokens := extractTokenCounts(respBytes)
-		if logErr := h.db.LogUsage(quotaItemID, inputTokens, outputTokens); logErr != nil {
+		if logErr := h.db.LogUsage(usageCtx, inputTokens, outputTokens); logErr != nil {
 			h.logger.Printf("Failed to log usage: %v", logErr)
 		}
 	}
