@@ -62,6 +62,10 @@ func main() {
 		loggingMiddleware.LogRequest(
 			authMiddleware.Authenticate(
 				http.HandlerFunc(proxyHandler.HandleChatCompletion))))
+	mux.Handle("/v1/messages",
+		loggingMiddleware.LogRequest(
+			authMiddleware.Authenticate(
+				http.HandlerFunc(proxyHandler.HandleMessages))))
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -77,6 +81,7 @@ func main() {
 		logger.Println("  GET  /health                 - Health check")
 		logger.Println("  POST /admin/create-key       - Create API token (x-admin-secret required)")
 		logger.Println("  POST /v1/chat/completions    - Chat completions (Bearer token required)")
+		logger.Println("  POST /v1/messages            - Anthropic Messages API (x-api-key or Bearer token)")
 		logger.Println("")
 		logger.Println("Subscription plans: cursor-pro-auto | cursor-pro-sonnet | cursor-pro-opus")
 		logger.Println("Press Ctrl+C to stop...")

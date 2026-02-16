@@ -71,6 +71,37 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status": "healthy", "service": "apipod-smart-proxy"}`))
 }
 
+// HandleMessages handles Anthropic Messages API requests (POST /v1/messages).
+func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, `{"error": {"type": "authentication_error", "message": "Unauthorized"}}`, http.StatusUnauthorized)
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.logger.Printf("Failed to read request body: %v", err)
+		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Failed to read request body"}}`, http.StatusBadRequest)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	var req struct {
+		Model string `json:"model"`
+	}
+	json.Unmarshal(bodyBytes, &req)
+
+	routing, err := h.router.RouteModel(user.SubID, req.Model)
+	if err != nil {
+		h.runnerLogger.Printf("ERROR [routing] model=%s user=%d sub=%d err=%v", req.Model, user.ID, user.SubID, err)
+		http.Error(w, `{"error": {"type": "not_found_error", "message": "Routing failed"}}`, http.StatusInternalServerError)
+		return
+	}
+
+	h.handleNativeUpstreamAnthropic(w, r, routing, user, req.Model, bodyBytes)
+}
+
 func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUserFromContext(r.Context())
 	if user == nil {

@@ -25,26 +25,26 @@ func NewAuthMiddleware(db *database.DB) *AuthMiddleware {
 	return &AuthMiddleware{db: db, logger: log.Default()}
 }
 
-// Authenticate wraps an HTTP handler with API key authentication
+// Authenticate wraps an HTTP handler with API key authentication.
+// Supports both "Authorization: Bearer <token>" and "x-api-key: <token>" headers.
 func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract Authorization header
+		// Extract API key from Authorization header or x-api-key header
+		var apiKey string
 		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, `{"error": "Missing Authorization header"}`, http.StatusUnauthorized)
-			return
+		if authHeader != "" {
+			const bearerPrefix = "Bearer "
+			if !strings.HasPrefix(authHeader, bearerPrefix) {
+				http.Error(w, `{"error": "Invalid Authorization header format. Expected: Bearer <token>"}`, http.StatusUnauthorized)
+				return
+			}
+			apiKey = strings.TrimPrefix(authHeader, bearerPrefix)
+		} else {
+			apiKey = r.Header.Get("x-api-key")
 		}
 
-		// Extract Bearer token
-		const bearerPrefix = "Bearer "
-		if !strings.HasPrefix(authHeader, bearerPrefix) {
-			http.Error(w, `{"error": "Invalid Authorization header format. Expected: Bearer <token>"}`, http.StatusUnauthorized)
-			return
-		}
-
-		apiKey := strings.TrimPrefix(authHeader, bearerPrefix)
 		if apiKey == "" {
-			http.Error(w, `{"error": "Empty API key"}`, http.StatusUnauthorized)
+			http.Error(w, `{"error": "Missing API key. Provide Authorization: Bearer <token> or x-api-key header"}`, http.StatusUnauthorized)
 			return
 		}
 

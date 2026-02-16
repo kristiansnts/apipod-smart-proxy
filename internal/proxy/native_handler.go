@@ -7,6 +7,7 @@ import (
 
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/antigravity"
+	"github.com/rpay/apipod-smart-proxy/internal/upstream/anthropiccompat"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/copilot"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/openaicompat"
 )
@@ -213,5 +214,206 @@ func (h *Handler) handleAntigravityNative(w http.ResponseWriter, r *http.Request
 		if usageCtx.QuotaItemID > 0 {
 			h.db.LogUsage(usageCtx, in, out)
 		}
+	}
+}
+
+// --- Anthropic Messages API endpoint handlers ---
+
+func (h *Handler) handleNativeUpstreamAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, user *database.User, originalModel string, bodyBytes []byte) {
+	usageCtx := database.UsageContext{
+		QuotaItemID:      routing.QuotaItemID,
+		UserID:           user.ID,
+		RequestedModel:   originalModel,
+		RoutedModel:      routing.Model,
+		UpstreamProvider: "anthropic:" + routing.ProviderType,
+	}
+
+	switch routing.ProviderType {
+	case "antigravity_proxy":
+		h.handleAntigravityFromAnthropic(w, r, routing, usageCtx, bodyBytes)
+	case "cliproxy":
+		h.handleCopilotFromAnthropic(w, r, routing, usageCtx, bodyBytes)
+	case "groq", "openai":
+		h.handleOpenAICompatFromAnthropic(w, r, routing, usageCtx, bodyBytes)
+	default:
+		http.Error(w, `{"error": {"type": "not_found_error", "message": "Unsupported provider type"}}`, http.StatusNotImplemented)
+	}
+}
+
+// handleAntigravityFromAnthropic proxies an Anthropic-format request directly to an Anthropic-compatible upstream.
+func (h *Handler) handleAntigravityFromAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte) {
+	var req struct{ Stream bool `json:"stream"` }
+	json.Unmarshal(bodyBytes, &req)
+
+	// Replace model in body with routed model
+	var body map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
+		return
+	}
+	body["model"] = routing.Model
+	bodyBytes, _ = json.Marshal(body)
+
+	apiKey := h.resolveAPIKey(routing)
+
+	resp, err := anthropiccompat.ProxyDirect(routing.BaseURL, apiKey, bodyBytes)
+	if err != nil {
+		h.runnerLogger.Printf("ERROR [antigravity_proxy/anthropic] model=%s url=%s err=%v", routing.Model, routing.BaseURL, err)
+		http.Error(w, `{"error": {"type": "api_error", "message": "Upstream request failed"}}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	usageCtx.StatusCode = resp.StatusCode
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		h.runnerLogger.Printf("ERROR [antigravity_proxy/anthropic] status=%d model=%s url=%s body=%s", resp.StatusCode, routing.Model, routing.BaseURL, string(respBody))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		if usageCtx.QuotaItemID > 0 {
+			h.db.LogUsage(usageCtx, 0, 0)
+		}
+		return
+	}
+
+	h.runnerLogger.Printf("OK [antigravity_proxy/anthropic] model=%s stream=%v", routing.Model, req.Stream)
+
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(resp.StatusCode)
+		in, out := antigravity.StreamTransform(resp.Body, w)
+		if usageCtx.QuotaItemID > 0 {
+			h.db.LogUsage(usageCtx, in, out)
+		}
+	} else {
+		respBytes, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBytes)
+
+		// Extract tokens from Anthropic response
+		var anthropicResp struct {
+			Usage struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(respBytes, &anthropicResp) == nil && usageCtx.QuotaItemID > 0 {
+			h.db.LogUsage(usageCtx, anthropicResp.Usage.InputTokens, anthropicResp.Usage.OutputTokens)
+		}
+	}
+}
+
+// handleCopilotFromAnthropic proxies an Anthropic-format request to a Copilot proxy (already speaks Anthropic format).
+func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte) {
+	var req struct{ Stream bool `json:"stream"` }
+	json.Unmarshal(bodyBytes, &req)
+
+	// Replace model with routed model
+	var body map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
+		return
+	}
+	body["model"] = routing.Model
+	bodyBytes, _ = json.Marshal(body)
+
+	resp, upstreamURL, err := copilot.ProxyToCopilot(routing.BaseURL, routing.APIKey, routing.Model, bodyBytes, req.Stream)
+	if err != nil {
+		h.runnerLogger.Printf("ERROR [cliproxy/anthropic] model=%s url=%s err=%v", routing.Model, upstreamURL, err)
+		http.Error(w, `{"error": {"type": "api_error", "message": "Upstream request failed"}}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	usageCtx.StatusCode = resp.StatusCode
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		h.runnerLogger.Printf("ERROR [cliproxy/anthropic] status=%d model=%s url=%s body=%s", resp.StatusCode, routing.Model, upstreamURL, string(respBody))
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+	} else {
+		h.runnerLogger.Printf("OK [cliproxy/anthropic] model=%s", routing.Model)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	}
+}
+
+// handleOpenAICompatFromAnthropic converts Anthropic→OpenAI, proxies, then converts response back to Anthropic.
+func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte) {
+	// Convert Anthropic request to OpenAI format
+	openaiBody, isStream, err := anthropiccompat.AnthropicToOpenAI(bodyBytes)
+	if err != nil {
+		h.logger.Printf("[%s/anthropic] conversion error: %v", routing.ProviderType, err)
+		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
+		return
+	}
+
+	// Replace model with routed model
+	var body map[string]interface{}
+	json.Unmarshal(openaiBody, &body)
+	body["model"] = routing.Model
+	openaiBody, _ = json.Marshal(body)
+
+	path := "/v1/chat/completions"
+	if routing.ProviderType == "groq" {
+		path = "/openai/v1/chat/completions"
+	}
+
+	apiKey := h.resolveAPIKey(routing)
+
+	upstreamURL := routing.BaseURL + path
+	keyHint := ""
+	if len(apiKey) > 8 {
+		keyHint = apiKey[:4] + "..." + apiKey[len(apiKey)-4:]
+	}
+
+	resp, err := openaicompat.Proxy(routing.BaseURL, apiKey, path, openaiBody)
+	if err != nil {
+		h.runnerLogger.Printf("ERROR [%s/anthropic] model=%s url=%s key=%s err=%v", routing.ProviderType, routing.Model, upstreamURL, keyHint, err)
+		http.Error(w, `{"error": {"type": "api_error", "message": "Upstream request failed"}}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	usageCtx.StatusCode = resp.StatusCode
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		h.runnerLogger.Printf("ERROR [%s/anthropic] status=%d model=%s url=%s key=%s body=%s", routing.ProviderType, resp.StatusCode, routing.Model, upstreamURL, keyHint, string(respBody))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		return
+	}
+
+	h.runnerLogger.Printf("OK [%s/anthropic] model=%s stream=%v", routing.ProviderType, routing.Model, isStream)
+
+	var inputTokens, outputTokens int
+
+	if isStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		inputTokens, outputTokens = anthropiccompat.OpenAIStreamToAnthropicStream(resp.Body, w, routing.Model)
+	} else {
+		respBody, _ := io.ReadAll(resp.Body)
+		anthropicResp, in, out, err := anthropiccompat.OpenAIResponseToAnthropic(respBody, routing.Model)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(respBody)
+			return
+		}
+		inputTokens, outputTokens = in, out
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(anthropicResp)
+	}
+
+	if usageCtx.QuotaItemID > 0 {
+		h.db.LogUsage(usageCtx, inputTokens, outputTokens)
 	}
 }
