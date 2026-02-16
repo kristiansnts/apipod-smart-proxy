@@ -49,8 +49,7 @@ func main() {
 	adminHandler := admin.NewHandler(db, cfg.AdminSecret)
 	proxyRouter := proxy.NewRouter(db)
 	
-	// Pass cfg to NewHandler
-	proxyHandler := proxy.NewHandler(cfg, proxyRouter, db, logger)
+	proxyHandler := proxy.NewHandler(proxyRouter, db, logger)
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()

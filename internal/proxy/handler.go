@@ -8,23 +8,20 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
 )
 
 type Handler struct {
-	cfg          *config.Config // Added config to the Handler struct
-	db           *database.DB
-	logger       *log.Logger
-	router       *Router
-	pools        map[int64]interface{}
-	poolsMu      sync.RWMutex
+	db      *database.DB
+	logger  *log.Logger
+	router  *Router
+	pools   map[int64]interface{}
+	poolsMu sync.RWMutex
 }
 
-func NewHandler(cfg *config.Config, router *Router, db *database.DB, logger *log.Logger) *Handler {
+func NewHandler(router *Router, db *database.DB, logger *log.Logger) *Handler {
 	return &Handler{
-		cfg:    cfg, // Initialize config
 		db:     db,
 		logger: logger,
 		router: router,

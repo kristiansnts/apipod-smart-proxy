@@ -52,8 +52,7 @@ func (h *Handler) handleAntigravityNative(w http.ResponseWriter, r *http.Request
 	var req struct{ Stream bool `json:"stream"` }
 	json.Unmarshal(bodyBytes, &req)
 
-	// Pass the internal API key from config to ProxyToGoogle
-	resp, err := antigravity.ProxyToGoogle(h.cfg.AntigravityInternalAPIKey, routing.Model, bodyBytes, req.Stream)
+	resp, err := antigravity.ProxyToAntigravity(routing.BaseURL, routing.APIKey, routing.Model, bodyBytes, req.Stream)
 	if err != nil {
 		h.logger.Printf("Upstream request failed: %v", err)
 		http.Error(w, `{"error": "Upstream request failed"}`, http.StatusBadGateway)
@@ -61,9 +60,14 @@ func (h *Handler) handleAntigravityNative(w http.ResponseWriter, r *http.Request
 	}
 	defer resp.Body.Close()
 
+	usageCtx.StatusCode = resp.StatusCode
+
 	if resp.StatusCode != http.StatusOK {
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
+		if usageCtx.QuotaItemID > 0 {
+			h.db.LogUsage(usageCtx, 0, 0)
+		}
 		return
 	}
 

@@ -9,16 +9,17 @@ type UsageContext struct {
 	RequestedModel   string
 	RoutedModel      string
 	UpstreamProvider string
+	StatusCode       int
 }
 
 // LogUsage inserts a usage log entry for a completed request
 func (db *DB) LogUsage(ctx UsageContext, inputTokens, outputTokens int) error {
 	totalTokens := inputTokens + outputTokens
 	_, err := db.conn.Exec(
-		`INSERT INTO usage_logs (quota_item_id, user_id, requested_model, routed_model, upstream_provider, token_count, input_tokens, output_tokens)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		`INSERT INTO usage_logs (quota_item_id, user_id, requested_model, routed_model, upstream_provider, status, token_count, input_tokens, output_tokens)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		ctx.QuotaItemID, ctx.UserID, ctx.RequestedModel, ctx.RoutedModel, ctx.UpstreamProvider,
-		totalTokens, inputTokens, outputTokens,
+		ctx.StatusCode, totalTokens, inputTokens, outputTokens,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to log usage: %w", err)

@@ -6,24 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 )
-
-// Google Response structures
-type GoogleResponse struct {
-	Candidates []GoogleCandidate `json:"candidates"`
-	Usage      GoogleUsage       `json:"usageMetadata"`
-}
-
-type GoogleCandidate struct {
-	Content GoogleContent `json:"content"`
-}
-
-type GoogleUsage struct {
-	PromptTokens     int `json:"promptTokenCount"`
-	CandidatesTokens int `json:"candidatesTokenCount"`
-	TotalTokens      int `json:"totalTokenCount"`
-}
 
 // Anthropic SSE structure
 type AnthropicEvent struct {
@@ -41,88 +24,62 @@ type AnthropicUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-// TransformResponse converts a non-streaming Google response to Anthropic format
-func TransformResponse(googleBody []byte, model string) ([]byte, int, int, error) {
-	var gResp GoogleResponse
-	if err := json.Unmarshal(googleBody, &gResp); err != nil {
+// AnthropicResponse represents the Anthropic Messages API response from the Rust engine
+type AnthropicResponse struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Role    string `json:"role"`
+	Model   string `json:"model"`
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Usage struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// TransformResponse passes through the Anthropic response from the Rust engine,
+// overriding the model name, and extracts token counts for usage logging.
+func TransformResponse(body []byte, model string) ([]byte, int, int, error) {
+	var resp AnthropicResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, 0, 0, err
 	}
 
-	text := ""
-	if len(gResp.Candidates) > 0 && len(gResp.Candidates[0].Content.Parts) > 0 {
-		text = gResp.Candidates[0].Content.Parts[0].Text
-	}
+	inputTokens := resp.Usage.InputTokens
+	outputTokens := resp.Usage.OutputTokens
 
-	anthropicResp := map[string]interface{}{
-		"id":    fmt.Sprintf("antigravity-%d", time.Now().Unix()),
-		"type":  "message",
-		"role":  "assistant",
-		"model": model,
-		"content": []map[string]interface{}{
-			{
-				"type": "text",
-				"text": text,
-			},
-		},
-		"usage": map[string]int{
-			"input_tokens":  gResp.Usage.PromptTokens,
-			"output_tokens": gResp.Usage.CandidatesTokens,
-		},
-	}
+	// Override model name to match the routed model
+	resp.Model = model
 
-	res, err := json.Marshal(anthropicResp)
-	return res, gResp.Usage.PromptTokens, gResp.Usage.CandidatesTokens, err
+	res, err := json.Marshal(resp)
+	return res, inputTokens, outputTokens, err
 }
 
-// StreamTransform reads Google's SSE stream and writes Anthropic SSE events
+// StreamTransform passes through the Anthropic SSE stream from the Rust engine,
+// capturing usage tokens along the way.
 func StreamTransform(r io.Reader, w io.Writer) (int, int) {
 	scanner := bufio.NewScanner(r)
 	inputTokens, outputTokens := 0, 0
 
-	fmt.Fprintf(w, "event: message_start\ndata: {\"type\": \"message_start\", \"message\": {\"role\": \"assistant\", \"content\": []}}\n\n")
-
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
 
-		data := strings.TrimPrefix(line, "data: ")
-		var gResp GoogleResponse
-		if err := json.Unmarshal([]byte(data), &gResp); err != nil {
-			continue
-		}
+		// Pass through all lines (event: lines, data: lines, empty lines)
+		fmt.Fprintf(w, "%s\n", line)
 
-		// Update usage if available
-		if gResp.Usage.TotalTokens > 0 {
-			inputTokens = gResp.Usage.PromptTokens
-			outputTokens = gResp.Usage.CandidatesTokens
-		}
-
-		if len(gResp.Candidates) > 0 && len(gResp.Candidates[0].Content.Parts) > 0 {
-			text := gResp.Candidates[0].Content.Parts[0].Text
-			event := AnthropicEvent{
-				Type: "content_block_delta",
-				Delta: &AnthropicDelta{
-					Text: text,
-				},
+		// Extract usage from data lines
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			var event AnthropicEvent
+			if err := json.Unmarshal([]byte(data), &event); err == nil && event.Usage != nil {
+				inputTokens = event.Usage.InputTokens
+				outputTokens = event.Usage.OutputTokens
 			}
-			eb, _ := json.Marshal(event)
-			fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", string(eb))
 		}
 	}
-
-	// Final usage and end events
-	usageEvent := AnthropicEvent{
-		Type: "message_delta",
-		Usage: &AnthropicUsage{
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
-		},
-	}
-	ub, _ := json.Marshal(usageEvent)
-	fmt.Fprintf(w, "event: message_delta\ndata: %s\n\n", string(ub))
-	fmt.Fprintf(w, "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
 
 	return inputTokens, outputTokens
 }
