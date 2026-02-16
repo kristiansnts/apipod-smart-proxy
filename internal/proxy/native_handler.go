@@ -109,17 +109,22 @@ func (h *Handler) handleOpenAICompat(w http.ResponseWriter, r *http.Request, rou
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream response directly without buffering
+	var inputTokens, outputTokens int
+
+	// Stream response directly while capturing tokens
 	if isStream {
-		io.Copy(w, resp.Body)
+		inputTokens, outputTokens = openaicompat.StreamTransform(resp.Body, w)
 	} else {
-		// Non-streaming: buffer to potentially parse usage later
+		// Non-streaming: buffer to parse usage
 		respBody, _ := io.ReadAll(resp.Body)
 		w.Write(respBody)
+		
+		// Extract token usage from response
+		inputTokens, outputTokens, _ = openaicompat.ExtractTokens(respBody)
 	}
 
 	if usageCtx.QuotaItemID > 0 {
-		h.db.LogUsage(usageCtx, 0, 0)
+		h.db.LogUsage(usageCtx, inputTokens, outputTokens)
 	}
 }
 
