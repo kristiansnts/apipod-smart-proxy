@@ -6,18 +6,15 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sync"
 
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
 )
 
 type Handler struct {
-	db      *database.DB
-	logger  *log.Logger
-	router  *Router
-	pools   map[int64]interface{}
-	poolsMu sync.RWMutex
+	db     *database.DB
+	logger *log.Logger
+	router *Router
 }
 
 func NewHandler(router *Router, db *database.DB, logger *log.Logger) *Handler {
@@ -25,7 +22,6 @@ func NewHandler(router *Router, db *database.DB, logger *log.Logger) *Handler {
 		db:     db,
 		logger: logger,
 		router: router,
-		pools:  make(map[int64]interface{}),
 	}
 }
 
@@ -57,8 +53,4 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.handleNativeUpstream(w, r, routing, user, req.Model, bodyBytes)
-}
-
-func (h *Handler) getAntigravityPool(providerID int64) (interface{}, error) {
-	return nil, nil
 }

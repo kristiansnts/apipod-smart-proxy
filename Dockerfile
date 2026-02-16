@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -27,11 +27,8 @@ WORKDIR /root/
 # Copy binary from builder
 COPY --from=builder /app/server .
 
-# Copy .env.example as template
-COPY .env.example .
-
-# Create data directory for database
-RUN mkdir -p /root/data
+# Copy .env if it exists (optional, env vars can come from docker-compose)
+COPY .env* ./
 
 # Expose port
 EXPOSE 8081
