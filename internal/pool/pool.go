@@ -1,4 +1,4 @@
-package antigravity
+package pool
 
 import (
 	"sync"
@@ -11,8 +11,6 @@ type Account struct {
 	APIKey     string
 	LimitType  string
 	LimitValue int
-	LastUsedAt time.Time
-	IsBusy     bool
 	MinuteHits int
 	DayHits    int
 }
@@ -20,6 +18,7 @@ type Account struct {
 type AccountPool struct {
 	Accounts []*Account
 	mu       sync.Mutex
+	index    int // round-robin index for spreading load
 }
 
 func NewAccountPool() *AccountPool {
@@ -53,32 +52,37 @@ func (p *AccountPool) startDayResetter() {
 	}
 }
 
-// GetReadyAccount returns the first account that is not busy and hasn't exceeded its rate limit.
+// GetReadyAccount picks the next account via round-robin that hasn't exceeded its rate limit.
+// Multiple concurrent requests can use the same account — only rate limits block selection.
 func (p *AccountPool) GetReadyAccount() *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for _, acc := range p.Accounts {
-		if acc.IsBusy {
-			continue
-		}
+	n := len(p.Accounts)
+	if n == 0 {
+		return nil
+	}
+
+	// Try all accounts starting from current index (round-robin)
+	for i := 0; i < n; i++ {
+		acc := p.Accounts[(p.index+i)%n]
 		if acc.LimitType == "rpm" && acc.MinuteHits >= acc.LimitValue {
 			continue
 		}
 		if acc.LimitType == "rpd" && acc.DayHits >= acc.LimitValue {
 			continue
 		}
-		acc.IsBusy = true
 		acc.MinuteHits++
 		acc.DayHits++
+		p.index = (p.index + i + 1) % n // advance past this account
 		return acc
 	}
 	return nil
 }
 
-func (p *AccountPool) ReleaseAccount(acc *Account) {
+// Size returns the number of accounts in the pool.
+func (p *AccountPool) Size() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	acc.LastUsedAt = time.Now()
-	acc.IsBusy = false
+	return len(p.Accounts)
 }

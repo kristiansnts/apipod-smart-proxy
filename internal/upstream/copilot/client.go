@@ -1,32 +1,41 @@
 package copilot
 
 import (
-	"io"
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 )
 
-// ProxyToCopilot sends the request to GitHub Copilot API
-func ProxyToCopilot(ghpToken string, model string, body []byte, stream bool) (*http.Response, error) {
-	// GitHub Copilot API Endpoint
-	apiURL := "https://api.githubcopilot.com/chat/completions"
+// ProxyToCopilot sends the request to cliproxy upstream (GHCP provider)
+// Returns the response and the upstream URL for logging purposes
+func ProxyToCopilot(baseURL string, ghpToken string, model string, body []byte, stream bool) (*http.Response, string, error) {
+	// Cliproxy API Endpoint from database
+	apiURL := strings.TrimRight(baseURL, "/") + "/v1/messages"
 
-	req, err := http.NewRequest("POST", apiURL, http.NoBody)
+	// Replace the model name in the request body with the routed model
+	var bodyMap map[string]interface{}
+	if err := json.Unmarshal(body, &bodyMap); err != nil {
+		return nil, apiURL, err
+	}
+	bodyMap["model"] = model
+	modifiedBody, err := json.Marshal(bodyMap)
 	if err != nil {
-		return nil, err
+		return nil, apiURL, err
 	}
 
-	// Important headers for Copilot
-	req.Header.Set("Authorization", "Bearer "+ghpToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Editor-Version", "vscode/1.90.0")
-	req.Header.Set("Editor-Plugin-Version", "copilot-chat/0.15.0")
-	req.Header.Set("User-Agent", "GitHubCopilotChat/0.15.0")
+	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(modifiedBody))
+	if err != nil {
+		return nil, apiURL, err
+	}
 
-	// Replace body
-	req.Body = io.NopCloser(strings.NewReader(string(body)))
+	// Headers for cliproxy upstream
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", ghpToken)
+	req.Header.Set("anthropic-version", "2023-06-01")
 
 	client := &http.Client{Timeout: 5 * time.Minute}
-	return client.Do(req)
+	resp, err := client.Do(req)
+	return resp, apiURL, err
 }

@@ -15,6 +15,7 @@ type RoutingResult struct {
 	APIKey       string
 	ProviderType string
 	QuotaItemID  int64
+	ProviderID   int64
 }
 
 // Router handles DB-driven weighted model routing
@@ -65,6 +66,7 @@ func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, e
 				APIKey:       item.APIKey,
 				ProviderType: item.ProviderType,
 				QuotaItemID:  item.QuotaID,
+				ProviderID:   item.ProviderID,
 			}, nil
 		}
 	}
@@ -77,5 +79,6 @@ func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, e
 		APIKey:       last.APIKey,
 		ProviderType: last.ProviderType,
 		QuotaItemID:  last.QuotaID,
+		ProviderID:   last.ProviderID,
 	}, nil
 }

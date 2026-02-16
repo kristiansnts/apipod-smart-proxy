@@ -18,6 +18,15 @@ import (
 
 func main() {
 	logger := log.New(os.Stdout, "[apipod-smart-proxy] ", log.LstdFlags|log.Lshortfile)
+
+	// Open runner.log (truncate on each run) for proxy request logging
+	runnerFile, err := os.Create("runner.log")
+	if err != nil {
+		logger.Fatalf("Failed to create runner.log: %v", err)
+	}
+	defer runnerFile.Close()
+	runnerLogger := log.New(runnerFile, "", log.LstdFlags)
+
 	logger.Println("Starting Apipod Smart Proxy...")
 
 	cfg, err := config.Load()
@@ -37,19 +46,13 @@ func main() {
 	defer db.Close()
 	logger.Println("Database initialized successfully")
 
-	// Seed subscription plans on startup
-	if err := db.Seed(); err != nil {
-		logger.Fatalf("Failed to seed database: %v", err)
-	}
-	logger.Println("Subscription plans seeded")
-
 	// Initialize components
 	authMiddleware := middleware.NewAuthMiddleware(db)
 	loggingMiddleware := middleware.NewLoggingMiddleware(logger)
 	adminHandler := admin.NewHandler(db, cfg.AdminSecret)
 	proxyRouter := proxy.NewRouter(db)
 	
-	proxyHandler := proxy.NewHandler(proxyRouter, db, logger)
+	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger)
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
