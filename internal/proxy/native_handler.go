@@ -8,6 +8,7 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/antigravity"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/copilot"
+	"github.com/rpay/apipod-smart-proxy/internal/upstream/openaicompat"
 )
 
 func (h *Handler) handleNativeUpstream(w http.ResponseWriter, r *http.Request, routing RoutingResult, user *database.User, originalModel string, bodyBytes []byte) {
@@ -19,17 +20,46 @@ func (h *Handler) handleNativeUpstream(w http.ResponseWriter, r *http.Request, r
 		UpstreamProvider: "native:" + routing.ProviderType,
 	}
 
-	if routing.ProviderType == "antigravity_native" {
+	switch routing.ProviderType {
+	case "antigravity_proxy":
 		h.handleAntigravityNative(w, r, routing, usageCtx, bodyBytes)
-		return
+	case "cliproxy":
+		h.handleCopilotNative(w, r, routing, usageCtx, bodyBytes)
+	case "groq", "openai":
+		h.handleOpenAICompat(w, r, routing, usageCtx, bodyBytes)
+	default:
+		http.Error(w, `{"error": "Unsupported provider type"}`, http.StatusNotImplemented)
+	}
+}
+
+func (h *Handler) handleOpenAICompat(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte) {
+	path := "/v1/chat/completions"
+	if routing.ProviderType == "groq" {
+		path = "/openai/v1/responses"
 	}
 
-	if routing.ProviderType == "copilot_native" {
-		h.handleCopilotNative(w, r, routing, usageCtx, bodyBytes)
+	resp, err := openaicompat.Proxy(routing.BaseURL, routing.APIKey, path, bodyBytes)
+	if err != nil {
+		h.logger.Printf("OpenAI-compat (%s) Error: %v", routing.ProviderType, err)
+		http.Error(w, `{"error": "Upstream request failed"}`, http.StatusBadGateway)
 		return
 	}
-	
-	http.Error(w, `{"error": "Native provider not yet fully implemented"}`, http.StatusNotImplemented)
+	defer resp.Body.Close()
+
+	usageCtx.StatusCode = resp.StatusCode
+
+	// Copy upstream headers
+	for k, v := range resp.Header {
+		for _, vv := range v {
+			w.Header().Add(k, vv)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+
+	if usageCtx.QuotaItemID > 0 {
+		h.db.LogUsage(usageCtx, 0, 0)
+	}
 }
 
 func (h *Handler) handleCopilotNative(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte) {
