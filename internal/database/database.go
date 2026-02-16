@@ -22,14 +22,16 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE TABLE IF NOT EXISTS llm_models (
     llm_model_id SERIAL PRIMARY KEY,
     model_name   VARCHAR(200) NOT NULL,
-    upstream     VARCHAR(50)  NOT NULL
+    upstream     VARCHAR(50)  NOT NULL,
+    UNIQUE (model_name, upstream) -- ADDED UNIQUE CONSTRAINT HERE
 );
 
 CREATE TABLE IF NOT EXISTS quota_items (
     quota_id          SERIAL PRIMARY KEY,
     sub_id            INTEGER NOT NULL REFERENCES subscriptions(sub_id),
     llm_model_id      INTEGER NOT NULL REFERENCES llm_models(llm_model_id),
-    percentage_weight INTEGER NOT NULL
+    percentage_weight INTEGER NOT NULL,
+    UNIQUE (sub_id, llm_model_id) -- ADDED UNIQUE CONSTRAINT HERE for quota_items as well
 );
 
 CREATE TABLE IF NOT EXISTS users (

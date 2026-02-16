@@ -25,7 +25,7 @@ func main() {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 	logger.Printf("Configuration loaded successfully")
-	logger.Printf("Upstream Antigravity: %s", cfg.AntigravityURL)
+	// logger.Printf("Upstream Antigravity: %s", cfg.AntigravityURL) // Removed, now local to Rust Engine
 	logger.Printf("Database: %s", cfg.DatabaseURL)
 	logger.Printf("Port: %s", cfg.Port)
 
@@ -48,6 +48,8 @@ func main() {
 	loggingMiddleware := middleware.NewLoggingMiddleware(logger)
 	adminHandler := admin.NewHandler(db, cfg.AdminSecret)
 	proxyRouter := proxy.NewRouter(db)
+	
+	// Pass cfg to NewHandler
 	proxyHandler := proxy.NewHandler(cfg, proxyRouter, db, logger)
 
 	// Setup HTTP routes

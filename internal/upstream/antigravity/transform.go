@@ -2,90 +2,89 @@ package antigravity
 
 import (
 	"encoding/json"
-	"fmt"
-	"strings"
+	"time"
 )
 
-// AnthropicRequest represents the incoming Claude-style payload
-type AnthropicRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	System      string    `json:"system,omitempty"`
-	Stream      bool      `json:"stream"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
-}
-
-type Message struct {
+type AnthropicResponse struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Usage struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
 }
 
-// GoogleRequest represents the payload for Vertex AI / Cloud Code
-type GoogleRequest struct {
-	Contents         []GoogleContent  `json:"contents"`
-	GenerationConfig GenerationConfig `json:"generationConfig"`
+type OpenAIResponse struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+		Index        int    `json:"index"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
-type GoogleContent struct {
-	Role  string       `json:"role"`
-	Parts []GooglePart `json:"parts"`
-}
-
-type GooglePart struct {
-	Text string `json:"text"`
-}
-
-type GenerationConfig struct {
-	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
-	Temperature     float64 `json:"temperature,omitempty"`
-	CandidateCount  int     `json:"candidateCount,omitempty"`
-}
-
-// TransformAnthropicToGoogle performs the heavy lifting of converting the protocol
-func TransformAnthropicToGoogle(anthropicBody []byte) ([]byte, error) {
-	var aReq AnthropicRequest
-	if err := json.Unmarshal(anthropicBody, &aReq); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal anthropic request: %w", err)
+func TransformResponse(body []byte, model string) ([]byte, int, int, error) {
+	var aResp AnthropicResponse
+	if err := json.Unmarshal(body, &aResp); err != nil {
+		return body, 0, 0, nil
 	}
 
-	var gContents []GoogleContent
-
-	// Handle System Prompt: Google Vertex requires system instructions as part of the messages 
-	// or in a separate field depending on the model. To be safe like Badri, we prepend it 
-	// to the first user message if it exists.
-	systemPrompt := aReq.System
-
-	for i, msg := range aReq.Messages {
-		role := msg.Role
-		if role == "assistant" {
-			role = "model"
-		}
-
-		content := msg.Content
-		if i == 0 && systemPrompt != "" && msg.Role == "user" {
-			content = fmt.Sprintf("%s\n\n%s", systemPrompt, content)
-		}
-
-		gContents = append(gContents, GoogleContent{
-			Role: role,
-			Parts: []GooglePart{{Text: content}},
-		})
+	text := ""
+	if len(aResp.Content) > 0 {
+		text = aResp.Content[0].Text
 	}
 
-	gReq := GoogleRequest{
-		Contents: gContents,
-		GenerationConfig: GenerationConfig{
-			MaxOutputTokens: aReq.MaxTokens,
-			Temperature:     aReq.Temperature,
-			CandidateCount:  1,
+	oResp := OpenAIResponse{
+		ID:      "chatcmpl-" + aResp.ID,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+	}
+
+	oResp.Choices = append(oResp.Choices, struct {
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+		Index        int    `json:"index"`
+	}{
+		Message: struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{
+			Role:    "assistant",
+			Content: text,
 		},
-	}
+		FinishReason: "stop",
+		Index:        0,
+	})
 
-	// Default reasonable values if missing
-	if gReq.GenerationConfig.MaxOutputTokens == 0 {
-		gReq.GenerationConfig.MaxOutputTokens = 4096
-	}
+	oResp.Usage.PromptTokens = aResp.Usage.InputTokens
+	oResp.Usage.CompletionTokens = aResp.Usage.OutputTokens
+	oResp.Usage.TotalTokens = aResp.Usage.InputTokens + aResp.Usage.OutputTokens
 
-	return json.Marshal(gReq)
+	res, err := json.Marshal(oResp)
+	return res, oResp.Usage.PromptTokens, oResp.Usage.CompletionTokens, err
+}
+
+func StreamTransform(r interface{}, w interface{}) (int, int) {
+	// Stub for now to avoid compilation errors, real streaming to be added next
+	return 0, 0
 }

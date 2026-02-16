@@ -3,10 +3,8 @@ package antigravity
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"time"
-	"fmt"
 )
 
 var transport = &http.Transport{
@@ -19,39 +17,43 @@ func ExchangeRefreshToken(refreshToken string) (string, error) {
 	return "internal-managed", nil
 }
 
-func ProxyToGoogle(accessToken string, model string, body []byte, stream bool) (*http.Response, error) {
-	var openAIReq struct {
+// ProxyToGoogle now accepts the internal API key directly
+func ProxyToGoogle(antigravityInternalAPIKey string, model string, body []byte, stream bool) (*http.Response, error) {
+	// 1. Parse incoming OpenAI body
+	var openAIReg struct {
+		Model    string `json:"model"`
 		Messages []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
 		} `json:"messages"`
+		MaxTokens   int     `json:"max_tokens"`
+		Temperature float64 `json:"temperature"`
 	}
-	json.Unmarshal(body, &openAIReq)
+	json.Unmarshal(body, &openAIReg)
 
-	// Translate OpenAI "Content String" to Anthropic "Content Array" (THE FIX)
-	anthropicMessages := make([]map[string]interface{}, 0)
-	for _, m := range openAIReq.Messages {
-		msg := map[string]interface{}{
-			"role": m.Role,
-			"content": []map[string]interface{}{
-				{
-					"type": "text",
-					"text": m.Content,
-				},
+	// 2. Convert to Anthropic format for the Rust Engine /v1/messages
+	type AnthropicMsg struct {
+		Role    string `json:"role"`
+		Content []map[string]interface{} `json:"content"`
+	}
+	var anthropicMsgs []AnthropicMsg
+	for _, m := range openAIReg.Messages {
+		anthropicMsgs = append(anthropicMsgs, AnthropicMsg{
+			Role: m.Role,
+			Content: []map[string]interface{}{
+				{"type": "text", "text": m.Content},
 			},
-		}
-		anthropicMessages = append(anthropicMessages, msg)
+		})
 	}
 
 	upstreamReq := map[string]interface{}{
-		"model":             model,
-		"messages":          anthropicMessages,
-		"max_tokens":        4096,
-		"stream":            stream,
+		"model":      "gemini-3-flash", // Hardcoded for now based on previous discussion
+		"messages":   anthropicMsgs,
+		"max_tokens": 1024,
 	}
-
+	
 	finalBody, _ := json.Marshal(upstreamReq)
-	apiURL := "http://localhost:8080/v1/messages"
+	apiURL := "http://localhost:8045/v1/messages" // Rust engine is always on localhost:8045
 	
 	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(finalBody))
 	if err != nil {
@@ -59,50 +61,9 @@ func ProxyToGoogle(accessToken string, model string, body []byte, stream bool) (
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", antigravityInternalAPIKey) // Use the passed API key
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Translation Layer: Badri -> OpenAI (So Cursor/UI works)
-	if !stream && resp.StatusCode == 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		var anthropicResp struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-			ID string `json:"id"`
-		}
-		
-		if err := json.Unmarshal(respBody, &anthropicResp); err == nil && len(anthropicResp.Content) > 0 {
-			openAIResp := map[string]interface{}{
-				"id":      anthropicResp.ID,
-				"object":  "chat.completion",
-				"created": time.Now().Unix(),
-				"model":   model,
-				"choices": []map[string]interface{}{
-					{
-						"message": map[string]interface{}{
-							"role":    "assistant",
-							"content": anthropicResp.Content[0].Text,
-						},
-						"finish_reason": "stop",
-						"index":         0,
-					},
-				},
-			}
-			newBody, _ := json.Marshal(openAIResp)
-			resp.Body = io.NopCloser(bytes.NewReader(newBody))
-			resp.ContentLength = int64(len(newBody))
-			resp.Header.Set("Content-Length", fmt.Sprint(len(newBody)))
-			resp.Header.Set("Content-Type", "application/json")
-		} else {
-			resp.Body = io.NopCloser(bytes.NewReader(respBody))
-		}
-	}
-
-	return resp, nil
+	return client.Do(req)
 }
