@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -21,7 +22,26 @@ type AnthropicRequest struct {
 	TopP        *float64          `json:"top_p,omitempty"`
 	Stream      bool              `json:"stream,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Tools       []interface{}     `json:"tools,omitempty"`
 	Metadata    json.RawMessage   `json:"metadata,omitempty"`
+}
+
+// ClaudeCodeRequest represents the full Claude Code request format
+type ClaudeCodeRequest struct {
+	Model       string            `json:"model"`
+	Messages    []AnthropicMsg    `json:"messages"`
+	Temperature float64           `json:"temperature"`
+	System      []SystemMessage   `json:"system"`
+	Tools       []interface{}     `json:"tools"`
+	Metadata    map[string]string `json:"metadata"`
+	MaxTokens   int               `json:"max_tokens"`
+	Stream      bool              `json:"stream"`
+}
+
+type SystemMessage struct {
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl map[string]interface{} `json:"cache_control,omitempty"`
 }
 
 type AnthropicMsg struct {
@@ -49,11 +69,23 @@ func AnthropicToOpenAI(body []byte) ([]byte, bool, error) {
 	var messages []OpenAIMessage
 
 	// Handle system prompt
+	systemContent := ""
 	if req.System != nil {
-		systemText := extractSystemText(req.System)
-		if systemText != "" {
-			messages = append(messages, OpenAIMessage{Role: "system", Content: systemText})
+		systemContent = extractSystemText(req.System)
+	}
+	
+	// Inject custom system message
+	customSystemMsg, err := loadCustomSystemMessage()
+	if err == nil && customSystemMsg != "" {
+		if systemContent != "" {
+			systemContent = customSystemMsg + "\n\n" + systemContent
+		} else {
+			systemContent = customSystemMsg
 		}
+	}
+	
+	if systemContent != "" {
+		messages = append(messages, OpenAIMessage{Role: "system", Content: systemContent})
 	}
 
 	// Convert messages
@@ -62,11 +94,20 @@ func AnthropicToOpenAI(body []byte) ([]byte, bool, error) {
 		messages = append(messages, OpenAIMessage{Role: m.Role, Content: text})
 	}
 
+	// Cap max_tokens to safe limits for different models
+	maxTokens := getMaxTokensForModel(req.Model, req.MaxTokens)
+
 	openaiReq := map[string]interface{}{
 		"model":      req.Model,
 		"messages":   messages,
-		"max_tokens": req.MaxTokens,
+		"max_tokens": maxTokens,
 		"stream":     req.Stream,
+	}
+	
+	// Add tools in OpenAI format for OpenAI-compatible endpoints
+	tools, err := loadMCPToolsForOpenAI()
+	if err == nil && len(tools) > 0 {
+		openaiReq["tools"] = tools
 	}
 	if req.Temperature != nil {
 		openaiReq["temperature"] = *req.Temperature
@@ -339,4 +380,221 @@ func getEventType(event interface{}) string {
 		}
 	}
 	return "unknown"
+}
+
+func loadCustomSystemMessage() (string, error) {
+	data, err := os.ReadFile("system_prompt.txt")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func loadMCPTools() ([]interface{}, error) {
+	data, err := os.ReadFile("mcp_tools.json")
+	if err != nil {
+		return nil, err
+	}
+	
+	var tools []interface{}
+	if err := json.Unmarshal(data, &tools); err != nil {
+		return nil, err
+	}
+	
+	return tools, nil
+}
+
+func getMaxTokensForModel(model string, requestedTokens int) int {
+	// Model-specific token limits
+	modelLimits := map[string]int{
+		// OpenAI models
+		"gpt-3.5-turbo": 4096,
+		"gpt-4": 8192,
+		"gpt-4-turbo": 4096,
+		"gpt-4o": 4096,
+		"gpt-4o-mini": 16384,
+		
+		// Anthropic models
+		"claude-3-haiku": 4096,
+		"claude-3-sonnet": 4096,
+		"claude-3-opus": 4096,
+		"claude-3.5-sonnet": 8192,
+		"claude-sonnet-4": 8192,
+		"claude-sonnet-4.5": 8192,
+		"claude-sonnet-4-5": 8192,
+		
+		// Groq/Other models
+		"llama3-8b-8192": 8192,
+		"llama3-70b-8192": 8192,
+		"mixtral-8x7b-32768": 32768,
+		"gemma-7b-it": 8192,
+		
+		// Moonshot/Kimi models
+		"moonshotai/kimi-k2-instruct-0905": 16384,
+		"moonshot-v1-8k": 8192,
+		"moonshot-v1-32k": 32768,
+		"moonshot-v1-128k": 128000,
+	}
+	
+	// Default limits
+	defaultLimit := 4096
+	maxSafeLimit := 16384
+	
+	// Get model-specific limit
+	modelLimit, exists := modelLimits[model]
+	if !exists {
+		// If model not found, use conservative default
+		modelLimit = defaultLimit
+	}
+	
+	// If no tokens requested, use reasonable default
+	if requestedTokens <= 0 {
+		return min(modelLimit, defaultLimit)
+	}
+	
+	// Cap to model's maximum and safe global limit
+	return min(requestedTokens, min(modelLimit, maxSafeLimit))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Convert MCP tools to OpenAI format
+func loadMCPToolsForOpenAI() ([]interface{}, error) {
+	tools, err := loadMCPTools()
+	if err != nil {
+		return nil, err
+	}
+	
+	var openaiTools []interface{}
+	for _, tool := range tools {
+		if toolMap, ok := tool.(map[string]interface{}); ok {
+			// Convert to OpenAI function format
+			openaiTool := map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name": toolMap["name"],
+					"description": toolMap["description"],
+					"parameters": toolMap["input_schema"],
+				},
+			}
+			openaiTools = append(openaiTools, openaiTool)
+		}
+	}
+	
+	return openaiTools, nil
+}
+
+// Convert MCP tools to Anthropic format (keep original for now)
+func loadMCPToolsForAnthropic() ([]interface{}, error) {
+	return loadMCPTools()
+}
+
+// Check if this is a Claude Code request format
+func isClaudeCodeRequest(bodyBytes []byte) bool {
+	var check struct {
+		System []interface{} `json:"system"`
+		Tools  []interface{} `json:"tools"`
+	}
+	if err := json.Unmarshal(bodyBytes, &check); err != nil {
+		return false
+	}
+	// Claude Code requests have system as array and tools array
+	return len(check.System) > 0 && len(check.Tools) > 0
+}
+
+// Inject system message into Claude Code request format
+func injectIntoClaudeCodeRequest(bodyBytes []byte, model string) []byte {
+	var req ClaudeCodeRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		return bodyBytes
+	}
+	
+	// Set the routed model
+	req.Model = model
+	
+	// Cap max_tokens to safe limits
+	req.MaxTokens = getMaxTokensForModel(model, req.MaxTokens)
+	
+	// Load and inject custom system message
+	customSystemMsg, err := loadCustomSystemMessage()
+	if err == nil && customSystemMsg != "" {
+		// Add our system message at the beginning
+		systemMsg := SystemMessage{
+			Type: "text",
+			Text: customSystemMsg,
+			CacheControl: map[string]interface{}{
+				"type": "ephemeral",
+			},
+		}
+		// Prepend our system message
+		req.System = append([]SystemMessage{systemMsg}, req.System...)
+	}
+	
+	// The tools are already in the request, so we don't need to inject them
+	// Claude Code handles tools properly
+	
+	modified, _ := json.Marshal(req)
+	return modified
+}
+
+func InjectSystemMessage(bodyBytes []byte, model string) []byte {
+	// Check if body is empty
+	if len(bodyBytes) == 0 {
+		return bodyBytes
+	}
+	
+	// Try to detect if this is a Claude Code request format
+	if isClaudeCodeRequest(bodyBytes) {
+		return injectIntoClaudeCodeRequest(bodyBytes, model)
+	}
+	
+	var req AnthropicRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		// Log error but return original body to avoid breaking the request
+		return bodyBytes
+	}
+
+	// Replace model with routed model
+	req.Model = model
+	
+	// Cap max_tokens to safe limits
+	req.MaxTokens = getMaxTokensForModel(model, req.MaxTokens)
+
+	// Handle system message injection
+	systemContent := ""
+	if req.System != nil {
+		systemContent = extractSystemText(req.System)
+	}
+	
+	// Inject custom system message
+	customSystemMsg, err := loadCustomSystemMessage()
+	if err == nil && customSystemMsg != "" {
+		if systemContent != "" {
+			systemContent = customSystemMsg + "\n\n" + systemContent
+		} else {
+			systemContent = customSystemMsg
+		}
+	}
+	
+	if systemContent != "" {
+		// Properly encode system content as JSON string
+		systemJSON, err := json.Marshal(systemContent)
+		if err == nil {
+			req.System = json.RawMessage(systemJSON)
+		}
+	}
+	
+	// Inject MCP tools in Anthropic format for direct Anthropic requests
+	tools, err := loadMCPToolsForAnthropic()
+	if err == nil && len(tools) > 0 {
+		req.Tools = tools
+	}
+
+	modified, _ := json.Marshal(req)
+	return modified
 }

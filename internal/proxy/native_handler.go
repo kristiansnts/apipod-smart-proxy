@@ -245,14 +245,8 @@ func (h *Handler) handleAntigravityFromAnthropic(w http.ResponseWriter, r *http.
 	var req struct{ Stream bool `json:"stream"` }
 	json.Unmarshal(bodyBytes, &req)
 
-	// Replace model in body with routed model
-	var body map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
-		return
-	}
-	body["model"] = routing.Model
-	bodyBytes, _ = json.Marshal(body)
+	// Replace model in body with routed model and inject system message
+	bodyBytes = anthropiccompat.InjectSystemMessage(bodyBytes, routing.Model)
 
 	apiKey := h.resolveAPIKey(routing)
 
@@ -311,14 +305,8 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 	var req struct{ Stream bool `json:"stream"` }
 	json.Unmarshal(bodyBytes, &req)
 
-	// Replace model with routed model
-	var body map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
-		return
-	}
-	body["model"] = routing.Model
-	bodyBytes, _ = json.Marshal(body)
+	// Replace model with routed model and inject system message
+	bodyBytes = anthropiccompat.InjectSystemMessage(bodyBytes, routing.Model)
 
 	resp, upstreamURL, err := copilot.ProxyToCopilot(routing.BaseURL, routing.APIKey, routing.Model, bodyBytes, req.Stream)
 	if err != nil {

@@ -85,12 +85,24 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Failed to read request body"}}`, http.StatusBadRequest)
 		return
 	}
+	
+	// Check if body is empty
+	if len(bodyBytes) == 0 {
+		h.logger.Printf("Empty request body received")
+		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Request body is empty"}}`, http.StatusBadRequest)
+		return
+	}
+	
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	var req struct {
 		Model string `json:"model"`
 	}
-	json.Unmarshal(bodyBytes, &req)
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		h.logger.Printf("Failed to parse request JSON: %v, body: %s", err, string(bodyBytes))
+		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid JSON in request body"}}`, http.StatusBadRequest)
+		return
+	}
 
 	routing, err := h.router.RouteModel(user.SubID, req.Model)
 	if err != nil {
@@ -115,12 +127,24 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
 		return
 	}
+	
+	// Check if body is empty
+	if len(bodyBytes) == 0 {
+		h.logger.Printf("Empty request body received")
+		http.Error(w, `{"error": "Request body is empty"}`, http.StatusBadRequest)
+		return
+	}
+	
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	var req struct {
 		Model string `json:"model"`
 	}
-	json.Unmarshal(bodyBytes, &req)
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		h.logger.Printf("Failed to parse request JSON: %v, body: %s", err, string(bodyBytes))
+		http.Error(w, `{"error": "Invalid JSON in request body"}`, http.StatusBadRequest)
+		return
+	}
 
 	routing, err := h.router.RouteModel(user.SubID, req.Model)
 	if err != nil {
