@@ -62,6 +62,10 @@ func TransformResponse(body []byte, model string) ([]byte, int, int, error) {
 // capturing usage tokens along the way.
 func StreamTransform(r io.Reader, w io.Writer) (int, int) {
 	scanner := bufio.NewScanner(r)
+	// Increase buffer size to 1MB to handle large SSE lines (e.g. tool calls)
+	buf := make([]byte, 1024*1024)
+	scanner.Buffer(buf, len(buf))
+
 	inputTokens, outputTokens := 0, 0
 
 	for scanner.Scan() {
