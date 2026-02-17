@@ -199,24 +199,25 @@ func (h *Handler) handleAntigravityNative(w http.ResponseWriter, r *http.Request
 	}
 
 	if req.Stream {
+		// Convert Anthropic SSE stream back to OpenAI SSE format for the client
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(resp.StatusCode)
-		in, out := antigravity.StreamTransform(resp.Body, w)
-		h.runnerLogger.Printf("OK [antigravity_proxy] model=%s stream=true tokens=%d/%d latency=%s user=%s req_size=%d",
-			routing.Model, in, out, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
+		in, out, hasToolCall := antigravity.StreamTransformToOpenAI(resp.Body, w, routing.Model)
+		h.runnerLogger.Printf("OK [antigravity_proxy] model=%s stream=true tool_call=%v tokens=%d/%d latency=%s user=%s req_size=%d",
+			routing.Model, hasToolCall, in, out, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
 		if usageCtx.QuotaItemID > 0 {
 			h.db.LogUsage(usageCtx, in, out)
 		}
 	} else {
+		// Convert Anthropic response back to OpenAI format for the client
 		respBytes, _ := io.ReadAll(resp.Body)
-		transformed, in, out, err := antigravity.TransformResponse(respBytes, routing.Model)
+		transformed, in, out, hasToolCall, err := antigravity.TransformResponseToOpenAI(respBytes, routing.Model)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(resp.StatusCode)
 			w.Write(respBytes)
 			return
 		}
-		hasToolCall := detectAnthropicToolCall(respBytes)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(transformed)
