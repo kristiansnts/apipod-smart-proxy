@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/orchestrator"
 )
+
+var validToolNameRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 type AnthropicRequest struct {
 	Model         string          `json:"model"`
@@ -81,52 +84,22 @@ type OpenAIMessage struct {
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
 }
 
-// SanitizeEmptyToolNames replaces empty tool_use names and their corresponding
-// tool_result references with a placeholder "_unknown" to prevent upstream
+// sanitizeToolName ensures a tool name matches ^[a-zA-Z0-9_-]+$ as required by OpenAI-compatible APIs.
+func sanitizeToolName(name string) string {
+	if name == "" {
+		return "_unknown"
+	}
+	sanitized := validToolNameRe.ReplaceAllString(name, "_")
+	if sanitized == "" {
+		return "_unknown"
+	}
+	return sanitized
+}
+
+// SanitizeEmptyToolNames replaces empty or invalid tool_use names and their corresponding
+// tool_result references with sanitized versions to prevent upstream
 // APIs (Gemini, OpenAI) from rejecting the request.
 func SanitizeEmptyToolNames(bodyBytes []byte) []byte {
-	var req struct {
-		Messages []json.RawMessage `json:"messages"`
-	}
-	if json.Unmarshal(bodyBytes, &req) != nil {
-		return bodyBytes
-	}
-
-	// First pass: find tool_use blocks with empty names and assign a placeholder
-	type toolUseBlock struct {
-		Type  string `json:"type"`
-		ID    string `json:"id,omitempty"`
-		Name  string `json:"name,omitempty"`
-	}
-
-	emptyNameIDs := make(map[string]bool)
-	modified := false
-
-	for _, rawMsg := range req.Messages {
-		var msg struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		}
-		if json.Unmarshal(rawMsg, &msg) != nil {
-			continue
-		}
-		var blocks []toolUseBlock
-		if json.Unmarshal(msg.Content, &blocks) != nil {
-			continue
-		}
-		for _, b := range blocks {
-			if b.Type == "tool_use" && b.Name == "" && b.ID != "" {
-				emptyNameIDs[b.ID] = true
-				modified = true
-			}
-		}
-	}
-
-	if !modified {
-		return bodyBytes
-	}
-
-	// Second pass: patch the body
 	var fullReq map[string]interface{}
 	if json.Unmarshal(bodyBytes, &fullReq) != nil {
 		return bodyBytes
@@ -137,6 +110,7 @@ func SanitizeEmptyToolNames(bodyBytes []byte) []byte {
 		return bodyBytes
 	}
 
+	modified := false
 	for _, rawMsg := range msgs {
 		msgMap, ok := rawMsg.(map[string]interface{})
 		if !ok {
@@ -154,22 +128,17 @@ func SanitizeEmptyToolNames(bodyBytes []byte) []byte {
 			bType, _ := blockMap["type"].(string)
 			if bType == "tool_use" {
 				name, _ := blockMap["name"].(string)
-				if name == "" {
-					blockMap["name"] = "_unknown"
-				}
-			}
-			if bType == "tool_result" {
-				toolUseID, _ := blockMap["tool_use_id"].(string)
-				if emptyNameIDs[toolUseID] {
-					if _, hasName := blockMap["name"]; hasName {
-						name, _ := blockMap["name"].(string)
-						if name == "" {
-							blockMap["name"] = "_unknown"
-						}
-					}
+				sanitized := sanitizeToolName(name)
+				if sanitized != name {
+					blockMap["name"] = sanitized
+					modified = true
 				}
 			}
 		}
+	}
+
+	if !modified {
+		return bodyBytes
 	}
 
 	result, err := json.Marshal(fullReq)
@@ -405,10 +374,7 @@ func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 			if argsBytes == nil {
 				argsBytes = []byte("{}")
 			}
-			name := b.Name
-			if name == "" {
-				name = "_unknown"
-			}
+			name := sanitizeToolName(b.Name)
 			toolCalls = append(toolCalls, OpenAIToolCall{
 				ID:   b.ID,
 				Type: "function",
