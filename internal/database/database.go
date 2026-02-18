@@ -57,6 +57,10 @@ CREATE INDEX IF NOT EXISTS idx_apitoken    ON users(apitoken);
 CREATE INDEX IF NOT EXISTS idx_user_active ON users(active);
 CREATE INDEX IF NOT EXISTS idx_quota_sub   ON quota_items(sub_id);
 CREATE INDEX IF NOT EXISTS idx_usage_quota ON usage_logs(quota_item_id);
+
+ALTER TABLE llm_models ADD COLUMN IF NOT EXISTS rpm INTEGER;
+ALTER TABLE llm_models ADD COLUMN IF NOT EXISTS tpm INTEGER;
+ALTER TABLE llm_models ADD COLUMN IF NOT EXISTS rpd INTEGER;
 `
 
 // New creates a new PostgreSQL database connection and initializes the schema

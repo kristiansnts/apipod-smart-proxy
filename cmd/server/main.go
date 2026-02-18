@@ -13,6 +13,7 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
+	"github.com/rpay/apipod-smart-proxy/internal/pool"
 	"github.com/rpay/apipod-smart-proxy/internal/proxy"
 )
 
@@ -51,8 +52,9 @@ func main() {
 	loggingMiddleware := middleware.NewLoggingMiddleware(logger)
 	adminHandler := admin.NewHandler(db, cfg.AdminSecret)
 	proxyRouter := proxy.NewRouter(db)
-	
-	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger)
+	modelLimiter := pool.NewModelLimiter()
+
+	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger, modelLimiter)
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()

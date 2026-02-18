@@ -16,6 +16,10 @@ type RoutingResult struct {
 	ProviderType string
 	QuotaItemID  int64
 	ProviderID   int64
+	LLMModelID   int64
+	RPM          *int
+	TPM          *int
+	RPD          *int
 }
 
 // Router handles DB-driven weighted model routing
@@ -67,6 +71,10 @@ func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, e
 				ProviderType: item.ProviderType,
 				QuotaItemID:  item.QuotaID,
 				ProviderID:   item.ProviderID,
+				LLMModelID:   item.LLMModelID,
+				RPM:          item.RPM,
+				TPM:          item.TPM,
+				RPD:          item.RPD,
 			}, nil
 		}
 	}
@@ -80,5 +88,9 @@ func (r *Router) RouteModel(subID int64, fallbackModel string) (RoutingResult, e
 		ProviderType: last.ProviderType,
 		QuotaItemID:  last.QuotaID,
 		ProviderID:   last.ProviderID,
+		LLMModelID:   last.LLMModelID,
+		RPM:          last.RPM,
+		TPM:          last.TPM,
+		RPD:          last.RPD,
 	}, nil
 }

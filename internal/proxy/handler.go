@@ -20,15 +20,17 @@ type Handler struct {
 	router       *Router
 	pools        map[int64]*pool.AccountPool
 	poolMu       sync.Mutex
+	modelLimiter *pool.ModelLimiter
 }
 
-func NewHandler(router *Router, db *database.DB, logger *log.Logger, runnerLogger *log.Logger) *Handler {
+func NewHandler(router *Router, db *database.DB, logger *log.Logger, runnerLogger *log.Logger, modelLimiter *pool.ModelLimiter) *Handler {
 	return &Handler{
 		db:           db,
 		logger:       logger,
 		runnerLogger: runnerLogger,
 		router:       router,
 		pools:        make(map[int64]*pool.AccountPool),
+		modelLimiter: modelLimiter,
 	}
 }
 
@@ -54,11 +56,9 @@ func (h *Handler) getPool(providerID int64) *pool.AccountPool {
 	p := pool.NewAccountPool()
 	for _, acc := range accounts {
 		p.Accounts = append(p.Accounts, &pool.Account{
-			ID:         acc.ID,
-			Email:      acc.Email,
-			APIKey:     acc.APIKey,
-			LimitType:  acc.LimitType,
-			LimitValue: acc.LimitValue,
+			ID:     acc.ID,
+			Email:  acc.Email,
+			APIKey: acc.APIKey,
 		})
 	}
 	h.pools[providerID] = p
@@ -111,6 +111,18 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.modelLimiter.SetLimits(routing.LLMModelID, routing.RPM, routing.TPM, routing.RPD)
+	if !h.modelLimiter.AllowRequest(routing.LLMModelID) {
+		h.runnerLogger.Printf("RATE_LIMITED [model] model=%s model_id=%d user=%s", routing.Model, routing.LLMModelID, user.Username)
+		http.Error(w, `{"error": {"type": "rate_limit_error", "message": "Model rate limit exceeded"}}`, http.StatusTooManyRequests)
+		return
+	}
+	if !h.modelLimiter.CheckTPM(routing.LLMModelID) {
+		h.runnerLogger.Printf("RATE_LIMITED [model/tpm] model=%s model_id=%d user=%s", routing.Model, routing.LLMModelID, user.Username)
+		http.Error(w, `{"error": {"type": "rate_limit_error", "message": "Model token rate limit exceeded"}}`, http.StatusTooManyRequests)
+		return
+	}
+
 	h.handleNativeUpstreamAnthropic(w, r, routing, user, req.Model, bodyBytes)
 }
 
@@ -150,6 +162,18 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.runnerLogger.Printf("ERROR [routing] model=%s user=%d sub=%d err=%v", req.Model, user.ID, user.SubID, err)
 		http.Error(w, `{"error": "Routing failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	h.modelLimiter.SetLimits(routing.LLMModelID, routing.RPM, routing.TPM, routing.RPD)
+	if !h.modelLimiter.AllowRequest(routing.LLMModelID) {
+		h.runnerLogger.Printf("RATE_LIMITED [model] model=%s model_id=%d user=%s", routing.Model, routing.LLMModelID, user.Username)
+		http.Error(w, `{"error": "Model rate limit exceeded"}`, http.StatusTooManyRequests)
+		return
+	}
+	if !h.modelLimiter.CheckTPM(routing.LLMModelID) {
+		h.runnerLogger.Printf("RATE_LIMITED [model/tpm] model=%s model_id=%d user=%s", routing.Model, routing.LLMModelID, user.Username)
+		http.Error(w, `{"error": "Model token rate limit exceeded"}`, http.StatusTooManyRequests)
 		return
 	}
 
