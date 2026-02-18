@@ -228,6 +228,9 @@ type openAIChatResponse struct {
 // executes them locally, and sends a follow-up request through the OpenAI-compat endpoint.
 // Returns the final Anthropic-format response bytes, input/output tokens, hasToolCall, and error.
 func (h *Handler) handleToolExecutionOpenAI(openaiRespBytes []byte, routing RoutingResult, openaiRequestBytes []byte, model string, path string) ([]byte, int, int, bool, error) {
+	// Try to extract tool calls from text for models that don't emit structured tool_calls
+	openaiRespBytes = anthropiccompat.ExtractToolCallsFromText(openaiRespBytes)
+
 	var response openAIChatResponse
 	if err := json.Unmarshal(openaiRespBytes, &response); err != nil {
 		return nil, 0, 0, false, err
@@ -241,6 +244,7 @@ func (h *Handler) handleToolExecutionOpenAI(openaiRespBytes []byte, routing Rout
 	}
 
 	hasToolCall := true
+	h.runnerLogger.Printf("[tool_execution] extracted %d tool calls from model=%s", len(response.Choices[0].Message.ToolCalls), model)
 	var toolCalls []tools.ToolCall
 
 	for _, tc := range response.Choices[0].Message.ToolCalls {
