@@ -1,9 +1,19 @@
 package config
 
+import "time"
+
 // ModelLimits defines token limits for different models to prevent bloated requests
 type ModelLimits struct {
 	MaxInputTokens  int
 	MaxOutputTokens int
+}
+
+// ModelTimeouts defines timeout configurations for different model tiers
+type ModelTimeouts struct {
+	RequestTimeout       time.Duration // HTTP request timeout
+	ToolContinueTimeout  time.Duration // Timeout for tool continuation requests
+	MaxRetries          int           // Maximum retry attempts
+	RetryDelay          time.Duration // Base delay between retries
 }
 
 // GetModelLimits returns token limits for a given model
@@ -58,4 +68,61 @@ func findInString(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// GetModelTimeouts returns timeout configurations for a given model
+func GetModelTimeouts(model string) ModelTimeouts {
+	switch {
+	// Free/slow models - much longer timeouts and more retries
+	case contains(model, "deepseek"):
+		return ModelTimeouts{
+			RequestTimeout:      10 * time.Minute, // Very long for slow models
+			ToolContinueTimeout: 15 * time.Minute, // Extra time for tool continuations
+			MaxRetries:         3,
+			RetryDelay:         30 * time.Second,
+		}
+	
+	// Claude models - standard timeouts
+	case contains(model, "claude"):
+		return ModelTimeouts{
+			RequestTimeout:      5 * time.Minute,
+			ToolContinueTimeout: 8 * time.Minute,
+			MaxRetries:         2,
+			RetryDelay:         10 * time.Second,
+		}
+	
+	// GPT models - faster response times
+	case contains(model, "gpt"):
+		return ModelTimeouts{
+			RequestTimeout:      3 * time.Minute,
+			ToolContinueTimeout: 5 * time.Minute,
+			MaxRetries:         2,
+			RetryDelay:         5 * time.Second,
+		}
+	
+	// Gemini models
+	case contains(model, "gemini"):
+		return ModelTimeouts{
+			RequestTimeout:      4 * time.Minute,
+			ToolContinueTimeout: 6 * time.Minute,
+			MaxRetries:         2,
+			RetryDelay:         10 * time.Second,
+		}
+	
+	// Default conservative settings for unknown models
+	default:
+		return ModelTimeouts{
+			RequestTimeout:      5 * time.Minute,
+			ToolContinueTimeout: 8 * time.Minute,
+			MaxRetries:         2,
+			RetryDelay:         10 * time.Second,
+		}
+	}
+}
+
+// IsSlowModel returns true if the model is considered slow/free tier
+func IsSlowModel(model string) bool {
+	return contains(model, "deepseek") || 
+		   contains(model, "free") ||
+		   contains(model, "3.5-turbo") // GPT-3.5 is often rate-limited
 }

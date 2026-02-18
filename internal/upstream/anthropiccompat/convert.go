@@ -790,6 +790,10 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 }
 
 func ProxyDirect(baseURL string, apiKey string, body []byte) (*http.Response, error) {
+	return ProxyDirectWithTimeout(baseURL, apiKey, body, 2*time.Minute)
+}
+
+func ProxyDirectWithTimeout(baseURL string, apiKey string, body []byte, timeout time.Duration) (*http.Response, error) {
 	apiURL := strings.TrimRight(baseURL, "/") + "/v1/messages"
 
 	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(body))
@@ -802,7 +806,7 @@ func ProxyDirect(baseURL string, apiKey string, body []byte) (*http.Response, er
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   2 * time.Minute,
+		Timeout:   timeout,
 	}
 	return client.Do(req)
 }
