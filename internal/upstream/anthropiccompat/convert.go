@@ -56,6 +56,7 @@ type ContentBlock struct {
 type FullContentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
@@ -73,10 +74,11 @@ type OpenAIToolCall struct {
 }
 
 type OpenAIMessage struct {
-	Role       string          `json:"role"`
-	Content    interface{}     `json:"content,omitempty"`
-	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Role             string           `json:"role"`
+	Content          interface{}      `json:"content,omitempty"`
+	ReasoningContent *string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
 }
 
 func DeduplicateToolResults(bodyBytes []byte) []byte {
@@ -287,10 +289,15 @@ func convertAnthropicMessageToOpenAI(m AnthropicMsg) []OpenAIMessage {
 
 func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 	var textParts []string
+	var thinkingParts []string
 	var toolCalls []OpenAIToolCall
 
 	for _, b := range blocks {
 		switch b.Type {
+		case "thinking":
+			if b.Thinking != "" {
+				thinkingParts = append(thinkingParts, b.Thinking)
+			}
 		case "text":
 			if b.Text != "" {
 				textParts = append(textParts, b.Text)
@@ -315,6 +322,10 @@ func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 	}
 
 	msg := OpenAIMessage{Role: "assistant"}
+	if len(thinkingParts) > 0 {
+		reasoning := strings.Join(thinkingParts, "\n")
+		msg.ReasoningContent = &reasoning
+	}
 	if len(textParts) > 0 {
 		msg.Content = strings.Join(textParts, "\n")
 	}
@@ -455,8 +466,9 @@ func OpenAIResponseToAnthropic(body []byte, model string) ([]byte, int, int, boo
 		ID      string `json:"id"`
 		Choices []struct {
 			Message struct {
-				Content   *string         `json:"content"`
-				ToolCalls []OpenAIToolCall `json:"tool_calls,omitempty"`
+				Content          *string         `json:"content"`
+				ReasoningContent *string         `json:"reasoning_content,omitempty"`
+				ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -484,6 +496,13 @@ func OpenAIResponseToAnthropic(body []byte, model string) ([]byte, int, int, boo
 		case "tool_calls":
 			stopReason = "tool_use"
 			hasToolCall = true
+		}
+
+		if choice.Message.ReasoningContent != nil && *choice.Message.ReasoningContent != "" {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type":     "thinking",
+				"thinking": *choice.Message.ReasoningContent,
+			})
 		}
 
 		if choice.Message.Content != nil && *choice.Message.Content != "" {
@@ -542,6 +561,7 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 	hasToolCall := false
 	started := false
 	blockIndex := 0
+	thinkingBlockStarted := false
 	textBlockStarted := false
 
 	type toolCallAccum struct {
@@ -555,8 +575,9 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 		ID      string `json:"id"`
 		Choices []struct {
 			Delta struct {
-				Role      string `json:"role,omitempty"`
-				Content   string `json:"content,omitempty"`
+				Role             string `json:"role,omitempty"`
+				Content          string `json:"content,omitempty"`
+				ReasoningContent string `json:"reasoning_content,omitempty"`
 				ToolCalls []struct {
 					Index    int    `json:"index"`
 					ID       string `json:"id,omitempty"`
@@ -620,7 +641,39 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 
 		delta := chunk.Choices[0].Delta
 
+		// Handle DeepSeek reasoning_content → Anthropic thinking block
+		if delta.ReasoningContent != "" {
+			if !thinkingBlockStarted {
+				thinkingBlockStarted = true
+				writeSSE(w, map[string]interface{}{
+					"type":  "content_block_start",
+					"index": blockIndex,
+					"content_block": map[string]interface{}{
+						"type":     "thinking",
+						"thinking": "",
+					},
+				})
+			}
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": blockIndex,
+				"delta": map[string]interface{}{
+					"type":     "thinking_delta",
+					"thinking": delta.ReasoningContent,
+				},
+			})
+		}
+
 		if delta.Content != "" {
+			// Close thinking block before starting text block
+			if thinkingBlockStarted && !textBlockStarted {
+				writeSSE(w, map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": blockIndex,
+				})
+				blockIndex++
+				thinkingBlockStarted = false
+			}
 			if !textBlockStarted {
 				textBlockStarted = true
 				writeSSE(w, map[string]interface{}{
@@ -658,6 +711,14 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 
 		if chunk.Choices[0].FinishReason != nil {
 			finishReason := *chunk.Choices[0].FinishReason
+
+			if thinkingBlockStarted {
+				writeSSE(w, map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": blockIndex,
+				})
+				blockIndex++
+			}
 
 			if textBlockStarted {
 				writeSSE(w, map[string]interface{}{
@@ -801,6 +862,8 @@ func getMaxTokensForModel(model string, requestedTokens int) int {
 		"moonshot-v1-8k":                  8192,
 		"moonshot-v1-32k":                 32768,
 		"moonshot-v1-128k":                128000,
+		"deepseek-chat":                   8192,
+		"deepseek-reasoner":               64000,
 	}
 
 	defaultLimit := 8192

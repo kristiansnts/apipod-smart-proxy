@@ -109,7 +109,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	routing, err := h.router.RouteModel(user.SubID, req.Model)
 	if err != nil {
-		h.runnerLogger.Printf("ERROR [routing] model=%s user=%d sub=%d err=%v", req.Model, user.ID, user.SubID, err)
+		h.runnerLogger.Printf("ERROR [routing] model=%s user=%s sub=%d err=%v", req.Model, user.ID, user.SubID, err)
 		http.Error(w, `{"error": {"type": "not_found_error", "message": "Routing failed"}}`, http.StatusInternalServerError)
 		return
 	}
@@ -163,7 +163,7 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	routing, err := h.router.RouteModel(user.SubID, req.Model)
 	if err != nil {
-		h.runnerLogger.Printf("ERROR [routing] model=%s user=%d sub=%d err=%v", req.Model, user.ID, user.SubID, err)
+		h.runnerLogger.Printf("ERROR [routing] model=%s user=%s sub=%d err=%v", req.Model, user.ID, user.SubID, err)
 		http.Error(w, `{"error": "Routing failed"}`, http.StatusInternalServerError)
 		return
 	}
