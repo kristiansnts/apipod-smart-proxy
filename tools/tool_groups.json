@@ -1,38 +1,38 @@
 {
   "classify": {
     "tools": [],
-    "prompt_sections": ["core", "classify"]
+    "prompt_sections": ["core_minimal", "classify"]
   },
   "plan": {
     "tools": [],
-    "prompt_sections": ["core", "plan"]
+    "prompt_sections": ["core_minimal", "plan"]
   },
   "question": {
     "tools": [],
-    "prompt_sections": ["core"]
+    "prompt_sections": ["core_minimal"]
   },
   "file_search": {
     "tools": ["Glob", "Grep", "Read", "Task"],
-    "prompt_sections": ["core", "tool_efficiency"]
+    "prompt_sections": ["core_minimal", "tool_efficiency"]
   },
   "code_edit": {
     "tools": ["Read", "Edit", "MultiEdit", "Write", "Glob", "Grep", "Bash", "BashOutput", "KillBash"],
-    "prompt_sections": ["core", "code_conventions", "tool_efficiency", "doing_tasks"]
+    "prompt_sections": ["core_minimal", "code_conventions", "tool_efficiency", "doing_tasks"]
   },
   "bash_command": {
     "tools": ["Bash", "BashOutput", "KillBash", "Read"],
-    "prompt_sections": ["core", "tool_efficiency"]
+    "prompt_sections": ["core_minimal", "tool_efficiency"]
   },
   "task_planning": {
     "tools": ["TodoWrite", "Read", "Glob", "Grep", "Task"],
-    "prompt_sections": ["core", "task_management", "tool_efficiency"]
+    "prompt_sections": ["core_minimal", "task_management", "tool_efficiency"]
   },
   "web_fetch": {
     "tools": ["WebFetch", "WebSearch"],
-    "prompt_sections": ["core", "tool_policy"]
+    "prompt_sections": ["core_minimal", "tool_policy"]
   },
   "full": {
-    "tools": ["*"],
-    "prompt_sections": ["core", "code_conventions", "task_management", "tool_efficiency", "tool_policy", "doing_tasks"]
+    "tools": ["Read", "Edit", "MultiEdit", "Write", "Glob", "Grep", "Bash", "BashOutput", "KillBash", "Task", "TodoWrite", "WebFetch", "WebSearch", "NotebookEdit", "ExitPlanMode"],
+    "prompt_sections": ["core", "tool_efficiency", "doing_tasks"]
   }
 }

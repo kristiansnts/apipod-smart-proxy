@@ -1,6 +1,6 @@
 {
   "name": "mcp__ide__getDiagnostics",
-  "description": "Get language diagnostics from VS Code",
+  "description": "Get diagnostic information from IDE.",
   "input_schema": {
     "type": "object",
     "properties": {
