@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	
+	"github.com/rpay/apipod-smart-proxy/internal/config"
 )
 
 type Orchestrator struct {
@@ -120,7 +122,7 @@ func (o *Orchestrator) Plan(pr PhaseRequest, intent string) (*PlanResult, error)
 	return &result, nil
 }
 
-func (o *Orchestrator) BuildExecuteRequest(originalBody []byte, intent string, planResult *PlanResult) ([]byte, error) {
+func (o *Orchestrator) BuildExecuteRequest(originalBody []byte, intent string, planResult *PlanResult, model string) ([]byte, error) {
 	group, err := GetGroupForIntent(intent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get group for intent %s: %w", intent, err)
@@ -156,6 +158,13 @@ func (o *Orchestrator) BuildExecuteRequest(originalBody []byte, intent string, p
 		delete(req, "tools")
 	}
 
+	// Apply model-specific token limits to prevent bloated requests
+	limits := config.GetModelLimits(model)
+	if limits.MaxOutputTokens > 0 {
+		maxTokensJSON, _ := json.Marshal(limits.MaxOutputTokens)
+		req["max_tokens"] = maxTokensJSON
+	}
+
 	return json.Marshal(req)
 }
 
@@ -174,7 +183,7 @@ func (o *Orchestrator) callAPI(baseURL string, apiKey string, body map[string]in
 	httpReq.Header.Set("x-api-key", apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
-	client := &http.Client{Timeout: 90 * time.Second}
+	client := &http.Client{Timeout: 2 * time.Minute}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, err

@@ -1006,7 +1006,7 @@ func InjectSystemMessageOrchestrated(bodyBytes []byte, model string, intent stri
 	req.Model = model
 	req.MaxTokens = getMaxTokensForModel(model, req.MaxTokens)
 
-	modified, err := orchestrator.New(nil).BuildExecuteRequest(mustMarshal(req), intent, planResult)
+	modified, err := orchestrator.New(nil).BuildExecuteRequest(mustMarshal(req), intent, planResult, model)
 	if err != nil {
 		return InjectSystemMessage(bodyBytes, model)
 	}

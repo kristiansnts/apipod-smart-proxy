@@ -330,24 +330,31 @@ func (h *Handler) handleAntigravityFromAnthropic(w http.ResponseWriter, r *http.
 		}
 	} else {
 		respBytes, _ := io.ReadAll(resp.Body)
+		
+		// Execute tools if present and get updated response
+		finalRespBytes, in, out, err := h.handleToolExecution(respBytes, routing, bodyBytes)
+		if err != nil {
+			h.runnerLogger.Printf("ERROR [tool_execution] model=%s err=%v", routing.Model, err)
+			// Fall back to original response
+			finalRespBytes = respBytes
+			var anthropicResp struct {
+				Usage struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal(respBytes, &anthropicResp) == nil {
+				in, out = anthropicResp.Usage.InputTokens, anthropicResp.Usage.OutputTokens
+			}
+		}
+		
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
-		w.Write(respBytes)
+		w.Write(finalRespBytes)
 
-		// Detect tool calls from Anthropic response
+		// Detect tool calls from original response
 		hasToolCall := detectAnthropicToolCall(respBytes)
 
-		// Extract tokens from Anthropic response
-		var anthropicResp struct {
-			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		in, out := 0, 0
-		if json.Unmarshal(respBytes, &anthropicResp) == nil {
-			in, out = anthropicResp.Usage.InputTokens, anthropicResp.Usage.OutputTokens
-		}
 		h.runnerLogger.Printf("OK [antigravity_proxy/anthropic] model=%s stream=%v tool_call=%v tokens=%d/%d latency=%s user=%s req_size=%d",
 			routing.Model, req.Stream, hasToolCall, in, out, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
 		h.modelLimiter.RecordTokens(routing.LLMModelID, in+out)
