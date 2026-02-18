@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/rpay/apipod-smart-proxy/internal/orchestrator"
 )
 
 type AnthropicRequest struct {
@@ -769,25 +770,11 @@ func getEventType(event interface{}) string {
 }
 
 func loadCustomSystemMessage() (string, error) {
-	data, err := os.ReadFile("system_prompt.txt")
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
+	return orchestrator.LoadFullPrompt()
 }
 
 func loadMCPTools() ([]interface{}, error) {
-	data, err := os.ReadFile("mcp_tools.json")
-	if err != nil {
-		return nil, err
-	}
-
-	var tools []interface{}
-	if err := json.Unmarshal(data, &tools); err != nil {
-		return nil, err
-	}
-
-	return tools, nil
+	return orchestrator.LoadAllTools()
 }
 
 func getMaxTokensForModel(model string, requestedTokens int) int {
@@ -937,4 +924,43 @@ func passClaudeCodeRequest(bodyBytes []byte, model string) []byte {
 		return bodyBytes
 	}
 	return modified
+}
+
+func InjectSystemMessageOrchestrated(bodyBytes []byte, model string, intent string, planResult *orchestrator.PlanResult) []byte {
+	if len(bodyBytes) == 0 {
+		return bodyBytes
+	}
+
+	if IsClaudeCodeRequest(bodyBytes) {
+		return passClaudeCodeRequest(bodyBytes, model)
+	}
+
+	var req AnthropicRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		return bodyBytes
+	}
+
+	req.Model = model
+	req.MaxTokens = getMaxTokensForModel(model, req.MaxTokens)
+
+	modified, err := orchestrator.New(nil).BuildExecuteRequest(mustMarshal(req), intent, planResult)
+	if err != nil {
+		return InjectSystemMessage(bodyBytes, model)
+	}
+
+	var result AnthropicRequest
+	if err := json.Unmarshal(modified, &result); err != nil {
+		return InjectSystemMessage(bodyBytes, model)
+	}
+
+	result.Model = model
+	result.MaxTokens = getMaxTokensForModel(model, req.MaxTokens)
+
+	out, _ := json.Marshal(result)
+	return out
+}
+
+func mustMarshal(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }

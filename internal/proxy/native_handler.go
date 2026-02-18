@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/database"
+	"github.com/rpay/apipod-smart-proxy/internal/orchestrator"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/antigravity"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/anthropiccompat"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/copilot"
@@ -30,7 +31,7 @@ func (h *Handler) handleNativeUpstream(w http.ResponseWriter, r *http.Request, r
 		h.handleAntigravityNative(w, r, routing, usageCtx, bodyBytes, startTime, username)
 	case "cliproxy":
 		h.handleCopilotNative(w, r, routing, usageCtx, bodyBytes, startTime, username)
-	case "groq", "openai":
+	case "groq", "openai", "deepseek":
 		h.handleOpenAICompat(w, r, routing, usageCtx, bodyBytes, startTime, username)
 	case "google_ai_studio":
 		h.handleGoogleAIStudio(w, r, routing, usageCtx, bodyBytes, startTime, username)
@@ -73,6 +74,8 @@ func (h *Handler) handleOpenAICompat(w http.ResponseWriter, r *http.Request, rou
 	path := "/v1/chat/completions"
 	if routing.ProviderType == "groq" {
 		path = "/openai/v1/chat/completions"
+	} else if routing.ProviderType == "deepseek" {
+		path = "/chat/completions"
 	}
 
 	apiKey := h.resolveAPIKey(routing)
@@ -275,7 +278,7 @@ func (h *Handler) handleNativeUpstreamAnthropic(w http.ResponseWriter, r *http.R
 		h.handleAntigravityFromAnthropic(w, r, routing, usageCtx, bodyBytes, startTime, username)
 	case "cliproxy":
 		h.handleCopilotFromAnthropic(w, r, routing, usageCtx, bodyBytes, startTime, username)
-	case "groq", "openai":
+	case "groq", "openai", "deepseek":
 		h.handleOpenAICompatFromAnthropic(w, r, routing, usageCtx, bodyBytes, startTime, username)
 	case "google_ai_studio":
 		h.handleGoogleAIStudioFromAnthropic(w, r, routing, usageCtx, bodyBytes, startTime, username)
@@ -289,9 +292,7 @@ func (h *Handler) handleAntigravityFromAnthropic(w http.ResponseWriter, r *http.
 	var req struct{ Stream bool `json:"stream"` }
 	json.Unmarshal(bodyBytes, &req)
 
-	// For Claude Code requests, only replace model and pass through untouched
-	// For other requests, inject system message and tools
-	bodyBytes = anthropiccompat.InjectSystemMessage(bodyBytes, routing.Model)
+	bodyBytes = h.orchestrateOrFallback(bodyBytes, routing, username)
 
 	apiKey := h.resolveAPIKey(routing)
 
@@ -362,7 +363,7 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 	json.Unmarshal(bodyBytes, &req)
 
 	// Replace model with routed model and inject system message
-	bodyBytes = anthropiccompat.InjectSystemMessage(bodyBytes, routing.Model)
+	bodyBytes = h.orchestrateOrFallback(bodyBytes, routing, username)
 
 	// Deduplicate tool_result blocks with the same tool_use_id
 	// The upstream OpenAI-compatible endpoint rejects duplicate tool_call_id values
@@ -410,6 +411,8 @@ func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http
 	path := "/v1/chat/completions"
 	if routing.ProviderType == "groq" {
 		path = "/openai/v1/chat/completions"
+	} else if routing.ProviderType == "deepseek" {
+		path = "/chat/completions"
 	}
 
 	apiKey := h.resolveAPIKey(routing)
@@ -618,4 +621,54 @@ func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *ht
 	if usageCtx.QuotaItemID > 0 {
 		h.db.LogUsage(usageCtx, inputTokens, outputTokens)
 	}
+}
+
+func (h *Handler) orchestrateOrFallback(bodyBytes []byte, routing RoutingResult, username string) []byte {
+	if anthropiccompat.IsClaudeCodeRequest(bodyBytes) {
+		return anthropiccompat.InjectSystemMessage(bodyBytes, routing.Model)
+	}
+
+	apiKey := h.resolveAPIKey(routing)
+	messages := extractMessagesForClassify(bodyBytes)
+	if messages == nil {
+		return anthropiccompat.InjectSystemMessage(bodyBytes, routing.Model)
+	}
+
+	pr := orchestrator.PhaseRequest{
+		BaseURL:  routing.BaseURL,
+		APIKey:   apiKey,
+		Model:    routing.Model,
+		Messages: messages,
+	}
+
+	classifyResult, err := h.orchestrator.Classify(pr)
+	if err != nil {
+		h.runnerLogger.Printf("[orchestrator] classify failed user=%s err=%v, falling back", username, err)
+		return anthropiccompat.InjectSystemMessage(bodyBytes, routing.Model)
+	}
+
+	if classifyResult.Intent == "question" {
+		return anthropiccompat.InjectSystemMessageOrchestrated(bodyBytes, routing.Model, "question", nil)
+	}
+
+	planResult, err := h.orchestrator.Plan(pr, classifyResult.Intent)
+	if err != nil {
+		h.runnerLogger.Printf("[orchestrator] plan failed user=%s err=%v, using classify intent only", username, err)
+	}
+
+	return anthropiccompat.InjectSystemMessageOrchestrated(bodyBytes, routing.Model, classifyResult.Intent, planResult)
+}
+
+func extractMessagesForClassify(bodyBytes []byte) []map[string]interface{} {
+	var req struct {
+		Messages []map[string]interface{} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		return nil
+	}
+	if len(req.Messages) == 0 {
+		return nil
+	}
+	last := req.Messages[len(req.Messages)-1]
+	return []map[string]interface{}{last}
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
+	"github.com/rpay/apipod-smart-proxy/internal/orchestrator"
 	"github.com/rpay/apipod-smart-proxy/internal/pool"
 )
 
@@ -21,6 +22,7 @@ type Handler struct {
 	pools        map[int64]*pool.AccountPool
 	poolMu       sync.Mutex
 	modelLimiter *pool.ModelLimiter
+	orchestrator *orchestrator.Orchestrator
 }
 
 func NewHandler(router *Router, db *database.DB, logger *log.Logger, runnerLogger *log.Logger, modelLimiter *pool.ModelLimiter) *Handler {
@@ -31,6 +33,7 @@ func NewHandler(router *Router, db *database.DB, logger *log.Logger, runnerLogge
 		router:       router,
 		pools:        make(map[int64]*pool.AccountPool),
 		modelLimiter: modelLimiter,
+		orchestrator: orchestrator.New(runnerLogger),
 	}
 }
 

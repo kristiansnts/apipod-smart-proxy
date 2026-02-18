@@ -1,0 +1,6 @@
+# Tool Efficiency
+- Only call tools when they are necessary to complete the task. If you can answer from your existing knowledge or context, do so without tool calls.
+- Before calling a tool, consider whether the information is already available in the conversation or can be inferred.
+- Combine multiple operations into a single tool call when possible (e.g. chaining bash commands with &&).
+- Avoid redundant tool calls — do not re-read files or re-run commands whose output you already have.
+- Prefer parallel tool calls for independent operations rather than sequential calls.
