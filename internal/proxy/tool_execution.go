@@ -3,7 +3,9 @@ package proxy
 import (
 	"encoding/json"
 	"io"
+	"time"
 
+	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/tools"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/anthropiccompat"
 )
@@ -65,11 +67,13 @@ func (h *Handler) handleToolExecution(respBytes []byte, routing RoutingResult, o
 
 	h.runnerLogger.Printf("[tool_execution] executing %d tools", len(toolCalls))
 
-	// Execute tools
+	// Execute tools with progress logging
 	var toolResults []map[string]interface{}
-	for _, call := range toolCalls {
+	for i, call := range toolCalls {
+		h.runnerLogger.Printf("[tool_execution] executing tool %d/%d: %s (id=%s)", i+1, len(toolCalls), call.Name, call.ID)
+		
 		result := h.toolExecutor.ExecuteTool(call)
-		h.runnerLogger.Printf("[tool_execution] executed %s: success=%v", call.Name, !result.IsError)
+		h.runnerLogger.Printf("[tool_execution] completed tool %d/%d: %s success=%v", i+1, len(toolCalls), call.Name, !result.IsError)
 		
 		toolResults = append(toolResults, map[string]interface{}{
 			"type":        "tool_result",
@@ -117,15 +121,12 @@ func (h *Handler) handleToolExecution(respBytes []byte, routing RoutingResult, o
 	// Get API key for follow-up request
 	apiKey := h.resolveAPIKey(routing)
 	
-	followupResp, err := anthropiccompat.ProxyDirect(routing.BaseURL, apiKey, followupBytes)
+	// Get model-specific timeouts and retry configuration
+	timeouts := config.GetModelTimeouts(routing.Model)
+	
+	followupBytes, err = h.executeToolContinuationWithRetry(routing.BaseURL, apiKey, followupBytes, timeouts, routing.Model)
 	if err != nil {
-		h.runnerLogger.Printf("[tool_execution] follow-up request failed: %v", err)
-		return respBytes, response.Usage.InputTokens, response.Usage.OutputTokens, err
-	}
-	defer followupResp.Body.Close()
-
-	followupBytes, err = io.ReadAll(followupResp.Body)
-	if err != nil {
+		h.runnerLogger.Printf("[tool_execution] follow-up request failed after retries: %v", err)
 		return respBytes, response.Usage.InputTokens, response.Usage.OutputTokens, err
 	}
 
@@ -144,4 +145,54 @@ func (h *Handler) handleToolExecution(respBytes []byte, routing RoutingResult, o
 
 	return followupBytes, totalInputTokens, totalOutputTokens, nil
 }
+
+// executeToolContinuationWithRetry executes a tool continuation request with retry logic and exponential backoff
+func (h *Handler) executeToolContinuationWithRetry(baseURL, apiKey string, requestBytes []byte, timeouts config.ModelTimeouts, model string) ([]byte, error) {
+	var lastErr error
+	
+	for attempt := 0; attempt <= timeouts.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff with jitter
+			delay := time.Duration(attempt) * timeouts.RetryDelay
+			h.runnerLogger.Printf("[tool_execution] retry %d/%d for model=%s, waiting %v", attempt, timeouts.MaxRetries, model, delay)
+			time.Sleep(delay)
+		}
+
+		h.runnerLogger.Printf("[tool_execution] attempting tool continuation (attempt %d/%d) for model=%s", attempt+1, timeouts.MaxRetries+1, model)
+		
+		// Create a custom ProxyDirect call with extended timeout
+		followupResp, err := anthropiccompat.ProxyDirectWithTimeout(baseURL, apiKey, requestBytes, timeouts.ToolContinueTimeout)
+		if err != nil {
+			lastErr = err
+			h.runnerLogger.Printf("[tool_execution] attempt %d failed for model=%s: %v", attempt+1, model, err)
+			continue
+		}
+		defer followupResp.Body.Close()
+
+		if followupResp.StatusCode >= 500 {
+			// Server error - retry
+			lastErr = err
+			h.runnerLogger.Printf("[tool_execution] server error %d on attempt %d for model=%s", followupResp.StatusCode, attempt+1, model)
+			continue
+		} else if followupResp.StatusCode >= 400 {
+			// Client error - don't retry
+			respBody, _ := io.ReadAll(followupResp.Body)
+			h.runnerLogger.Printf("[tool_execution] client error %d for model=%s: %s", followupResp.StatusCode, model, string(respBody))
+			return respBody, err
+		}
+
+		// Success
+		followupBytes, err := io.ReadAll(followupResp.Body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		
+		h.runnerLogger.Printf("[tool_execution] successful continuation on attempt %d for model=%s", attempt+1, model)
+		return followupBytes, nil
+	}
+	
+	return nil, lastErr
+}
+
 

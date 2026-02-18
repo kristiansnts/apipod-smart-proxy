@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
+
+var validToolNameRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 var transport = &http.Transport{
 	MaxIdleConns:        500,
@@ -84,6 +87,12 @@ func ProxyToAntigravity(baseURL string, apiKey string, model string, body []byte
 
 			// Convert tool_calls to tool_use blocks
 			for _, tc := range msg.ToolCalls {
+				name := tc.Function.Name
+				if name == "" {
+					name = "_unknown"
+				} else {
+					name = validToolNameRe.ReplaceAllString(name, "_")
+				}
 				var inputParsed interface{}
 				if json.Unmarshal([]byte(tc.Function.Arguments), &inputParsed) != nil {
 					inputParsed = map[string]interface{}{}
@@ -91,7 +100,7 @@ func ProxyToAntigravity(baseURL string, apiKey string, model string, body []byte
 				contentBlocks = append(contentBlocks, map[string]interface{}{
 					"type":  "tool_use",
 					"id":    tc.ID,
-					"name":  tc.Function.Name,
+					"name":  name,
 					"input": inputParsed,
 				})
 			}
