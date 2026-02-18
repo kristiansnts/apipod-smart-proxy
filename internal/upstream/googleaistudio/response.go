@@ -71,22 +71,27 @@ func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, 
 				if part.FunctionCall != nil {
 					hasToolCall = true
 					argsBytes, _ := json.Marshal(part.FunctionCall.Args)
+					toolCallData := map[string]interface{}{
+						"index": 0,
+						"id":    "call_" + part.FunctionCall.Name,
+						"type":  "function",
+						"function": map[string]interface{}{
+							"name":      part.FunctionCall.Name,
+							"arguments": string(argsBytes),
+						},
+					}
+					// Include thoughtSignature if present
+					if part.ThoughtSignature != "" {
+						toolCallData["extra_content"] = map[string]interface{}{
+							"google": map[string]interface{}{
+								"thought_signature": part.ThoughtSignature,
+							},
+						}
+					}
 					chunk["choices"] = []map[string]interface{}{
 						{
-							"index": 0,
-							"delta": map[string]interface{}{
-								"tool_calls": []map[string]interface{}{
-									{
-										"index": 0,
-										"id":    "call_" + part.FunctionCall.Name,
-										"type":  "function",
-										"function": map[string]interface{}{
-											"name":      part.FunctionCall.Name,
-											"arguments": string(argsBytes),
-										},
-									},
-								},
-							},
+							"index":         0,
+							"delta":         map[string]interface{}{"tool_calls": []map[string]interface{}{toolCallData}},
 							"finish_reason": nil,
 						},
 					}

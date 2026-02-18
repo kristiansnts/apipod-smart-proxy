@@ -1,6 +1,10 @@
 package googleaistudio
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // --- OpenAI request/response types (subset) ---
 
@@ -37,6 +41,7 @@ type openAIToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	ExtraContent map[string]interface{} `json:"extra_content,omitempty"`
 }
 
 // --- Gemini types ---
@@ -57,6 +62,7 @@ type geminiPart struct {
 	Text             string                  `json:"text,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -117,6 +123,9 @@ func cleanSchema(raw json.RawMessage) json.RawMessage {
 	// Remove unsupported top-level fields
 	delete(m, "$schema")
 	delete(m, "additionalProperties")
+	delete(m, "exclusiveMinimum")
+	delete(m, "exclusiveMaximum")
+	delete(m, "propertyNames")
 
 	// Recurse into "properties" values
 	if props, ok := m["properties"]; ok {
@@ -217,17 +226,59 @@ func OpenAIToGemini(body []byte) ([]byte, string, bool, error) {
 		case "assistant":
 			var parts []geminiPart
 			if len(msg.ToolCalls) > 0 {
+				// Check if any tool call has a thoughtSignature
+				hasAnySignature := false
 				for _, tc := range msg.ToolCalls {
-					var args json.RawMessage
-					if tc.Function.Arguments != "" {
-						args = json.RawMessage(tc.Function.Arguments)
+					if tc.ExtraContent != nil {
+						if googleData, ok := tc.ExtraContent["google"].(map[string]interface{}); ok {
+							if sig, ok := googleData["thought_signature"].(string); ok && sig != "" {
+								hasAnySignature = true
+								break
+							}
+						}
 					}
-					parts = append(parts, geminiPart{
-						FunctionCall: &geminiFunctionCall{
-							Name: tc.Function.Name,
-							Args: args,
-						},
-					})
+				}
+
+				if hasAnySignature {
+					// Tool calls originated from Gemini — use native functionCall parts with signatures
+					for _, tc := range msg.ToolCalls {
+						var args json.RawMessage
+						if tc.Function.Arguments != "" {
+							args = json.RawMessage(tc.Function.Arguments)
+						}
+						var thoughtSig string
+						if tc.ExtraContent != nil {
+							if googleData, ok := tc.ExtraContent["google"].(map[string]interface{}); ok {
+								if sig, ok := googleData["thought_signature"].(string); ok {
+									thoughtSig = sig
+								}
+							}
+						}
+						part := geminiPart{
+							FunctionCall: &geminiFunctionCall{
+								Name: tc.Function.Name,
+								Args: args,
+							},
+						}
+						if thoughtSig != "" {
+							part.ThoughtSignature = thoughtSig
+						}
+						parts = append(parts, part)
+					}
+				} else {
+					// Tool calls from non-Gemini clients — convert to text to avoid
+					// thoughtSignature validation errors
+					var textParts []string
+					text := getTextContent(msg.Content)
+					if text != "" {
+						textParts = append(textParts, text)
+					}
+					for _, tc := range msg.ToolCalls {
+						textParts = append(textParts, fmt.Sprintf("[Calling function %s(%s)]", tc.Function.Name, tc.Function.Arguments))
+					}
+					if len(textParts) > 0 {
+						parts = append(parts, geminiPart{Text: strings.Join(textParts, "\n")})
+					}
 				}
 			} else {
 				text := getTextContent(msg.Content)
@@ -243,28 +294,39 @@ func OpenAIToGemini(body []byte) ([]byte, string, bool, error) {
 			}
 
 		case "tool":
-			// Tool result — wrap in functionResponse.
-			// Gemini requires response to be a JSON object (Struct), not a plain string.
-			var respObj json.RawMessage
+			// Tool result
 			contentStr := getTextContent(msg.Content)
-			// If it's already a valid JSON object, use it directly
-			var probe map[string]json.RawMessage
-			if json.Unmarshal([]byte(contentStr), &probe) == nil {
-				respObj = json.RawMessage(contentStr)
+			// Check if the corresponding function call had a thoughtSignature
+			// by looking for the tool call in previous messages
+			hasSig := hasThoughtSignatureForToolCall(req.Messages, msg.ToolCallID)
+			if hasSig {
+				// Use native functionResponse for Gemini-originated calls
+				var respObj json.RawMessage
+				var probe map[string]json.RawMessage
+				if json.Unmarshal([]byte(contentStr), &probe) == nil {
+					respObj = json.RawMessage(contentStr)
+				} else {
+					wrapped, _ := json.Marshal(map[string]string{"result": contentStr})
+					respObj = json.RawMessage(wrapped)
+				}
+				gemReq.Contents = append(gemReq.Contents, geminiContent{
+					Role: "user",
+					Parts: []geminiPart{{
+						FunctionResponse: &geminiFunctionResponse{
+							Name:     msg.ToolCallID,
+							Response: respObj,
+						},
+					}},
+				})
 			} else {
-				// Wrap plain string/other values in {"result": "..."}
-				wrapped, _ := json.Marshal(map[string]string{"result": contentStr})
-				respObj = json.RawMessage(wrapped)
+				// Convert to text for non-Gemini tool results
+				toolName := msg.ToolCallID
+				text := fmt.Sprintf("[Result of %s]: %s", toolName, contentStr)
+				gemReq.Contents = append(gemReq.Contents, geminiContent{
+					Role:  "user",
+					Parts: []geminiPart{{Text: text}},
+				})
 			}
-			gemReq.Contents = append(gemReq.Contents, geminiContent{
-				Role: "user",
-				Parts: []geminiPart{{
-					FunctionResponse: &geminiFunctionResponse{
-						Name:     msg.ToolCallID,
-						Response: respObj,
-					},
-				}},
-			})
 		}
 	}
 
@@ -292,6 +354,29 @@ func mergeConsecutiveRoles(contents []geminiContent) []geminiContent {
 	return merged
 }
 
+// hasThoughtSignatureForToolCall checks if the assistant message containing the given
+// tool call ID has a thoughtSignature (i.e., it originated from Gemini).
+func hasThoughtSignatureForToolCall(messages []openAIMessage, toolCallID string) bool {
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, tc := range msg.ToolCalls {
+			if tc.ID == toolCallID {
+				if tc.ExtraContent != nil {
+					if googleData, ok := tc.ExtraContent["google"].(map[string]interface{}); ok {
+						if sig, ok := googleData["thought_signature"].(string); ok && sig != "" {
+							return true
+						}
+					}
+				}
+				return false
+			}
+		}
+	}
+	return false
+}
+
 // GeminiToOpenAI converts a Gemini response to OpenAI chat completion format.
 func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
 	var resp geminiResponse
@@ -316,7 +401,7 @@ func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
 			if part.FunctionCall != nil {
 				hasToolCall = true
 				argsBytes, _ := json.Marshal(part.FunctionCall.Args)
-				toolCalls = append(toolCalls, openAIToolCall{
+				toolCall := openAIToolCall{
 					ID:   "call_" + part.FunctionCall.Name,
 					Type: "function",
 					Function: struct {
@@ -326,7 +411,16 @@ func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
 						Name:      part.FunctionCall.Name,
 						Arguments: string(argsBytes),
 					},
-				})
+				}
+				// Include thoughtSignature if present
+				if part.ThoughtSignature != "" {
+					toolCall.ExtraContent = map[string]interface{}{
+						"google": map[string]interface{}{
+							"thought_signature": part.ThoughtSignature,
+						},
+					}
+				}
+				toolCalls = append(toolCalls, toolCall)
 			} else if part.Text != "" {
 				content += part.Text
 			}
