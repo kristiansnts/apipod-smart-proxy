@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/orchestrator"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/antigravity"
@@ -294,9 +295,14 @@ func (h *Handler) handleAntigravityFromAnthropic(w http.ResponseWriter, r *http.
 
 	bodyBytes = h.orchestrateOrFallback(bodyBytes, routing, username)
 
+	// Sanitize empty tool names before forwarding
+	bodyBytes = anthropiccompat.SanitizeEmptyToolNames(bodyBytes)
+
 	apiKey := h.resolveAPIKey(routing)
 
-	resp, err := anthropiccompat.ProxyDirect(routing.BaseURL, apiKey, bodyBytes)
+	// Use model-specific timeout for initial request
+	timeouts := config.GetModelTimeouts(routing.Model)
+	resp, err := anthropiccompat.ProxyDirectWithTimeout(routing.BaseURL, apiKey, bodyBytes, timeouts.RequestTimeout)
 	if err != nil {
 		h.runnerLogger.Printf("ERROR [antigravity_proxy/anthropic] model=%s url=%s user=%s latency=%s err=%v", routing.Model, routing.BaseURL, username, time.Since(startTime).Round(time.Millisecond), err)
 		http.Error(w, `{"error": {"type": "api_error", "message": "Upstream request failed"}}`, http.StatusBadGateway)
@@ -375,6 +381,9 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 	// Deduplicate tool_result blocks with the same tool_use_id
 	// The upstream OpenAI-compatible endpoint rejects duplicate tool_call_id values
 	bodyBytes = anthropiccompat.DeduplicateToolResults(bodyBytes)
+
+	// Sanitize empty tool names before forwarding
+	bodyBytes = anthropiccompat.SanitizeEmptyToolNames(bodyBytes)
 
 	resp, upstreamURL, err := copilot.ProxyToCopilot(routing.BaseURL, routing.APIKey, routing.Model, bodyBytes, req.Stream)
 	if err != nil {

@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/orchestrator"
 )
+
+var validToolNameRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 type AnthropicRequest struct {
 	Model         string          `json:"model"`
@@ -79,6 +82,70 @@ type OpenAIMessage struct {
 	ReasoningContent *string          `json:"reasoning_content,omitempty"`
 	ToolCalls        []OpenAIToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
+}
+
+// sanitizeToolName ensures a tool name matches ^[a-zA-Z0-9_-]+$ as required by OpenAI-compatible APIs.
+func sanitizeToolName(name string) string {
+	if name == "" {
+		return "_unknown"
+	}
+	sanitized := validToolNameRe.ReplaceAllString(name, "_")
+	if sanitized == "" {
+		return "_unknown"
+	}
+	return sanitized
+}
+
+// SanitizeEmptyToolNames replaces empty or invalid tool_use names and their corresponding
+// tool_result references with sanitized versions to prevent upstream
+// APIs (Gemini, OpenAI) from rejecting the request.
+func SanitizeEmptyToolNames(bodyBytes []byte) []byte {
+	var fullReq map[string]interface{}
+	if json.Unmarshal(bodyBytes, &fullReq) != nil {
+		return bodyBytes
+	}
+
+	msgs, ok := fullReq["messages"].([]interface{})
+	if !ok {
+		return bodyBytes
+	}
+
+	modified := false
+	for _, rawMsg := range msgs {
+		msgMap, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		contentArr, ok := msgMap["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, block := range contentArr {
+			blockMap, ok := block.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			bType, _ := blockMap["type"].(string)
+			if bType == "tool_use" {
+				name, _ := blockMap["name"].(string)
+				sanitized := sanitizeToolName(name)
+				if sanitized != name {
+					blockMap["name"] = sanitized
+					modified = true
+				}
+			}
+		}
+	}
+
+	if !modified {
+		return bodyBytes
+	}
+
+	result, err := json.Marshal(fullReq)
+	if err != nil {
+		return bodyBytes
+	}
+	return result
 }
 
 func DeduplicateToolResults(bodyBytes []byte) []byte {
@@ -307,6 +374,7 @@ func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 			if argsBytes == nil {
 				argsBytes = []byte("{}")
 			}
+			name := sanitizeToolName(b.Name)
 			toolCalls = append(toolCalls, OpenAIToolCall{
 				ID:   b.ID,
 				Type: "function",
@@ -314,7 +382,7 @@ func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
 				}{
-					Name:      b.Name,
+					Name:      name,
 					Arguments: string(argsBytes),
 				},
 			})
@@ -790,6 +858,10 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 }
 
 func ProxyDirect(baseURL string, apiKey string, body []byte) (*http.Response, error) {
+	return ProxyDirectWithTimeout(baseURL, apiKey, body, 2*time.Minute)
+}
+
+func ProxyDirectWithTimeout(baseURL string, apiKey string, body []byte, timeout time.Duration) (*http.Response, error) {
 	apiURL := strings.TrimRight(baseURL, "/") + "/v1/messages"
 
 	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(body))
@@ -802,7 +874,7 @@ func ProxyDirect(baseURL string, apiKey string, body []byte) (*http.Response, er
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   2 * time.Minute,
+		Timeout:   timeout,
 	}
 	return client.Do(req)
 }

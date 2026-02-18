@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type Executor struct {
@@ -30,33 +31,43 @@ type ToolResult struct {
 }
 
 func (e *Executor) ExecuteTool(call ToolCall) ToolResult {
-	e.logger.Printf("[tools] executing %s with id %s", call.Name, call.ID)
+	startTime := time.Now()
+	e.logger.Printf("[tools] starting execution of %s (id=%s)", call.Name, call.ID)
 	
+	var result ToolResult
 	switch call.Name {
 	case "Read":
-		return e.executeRead(call)
+		result = e.executeRead(call)
 	case "Bash":
-		return e.executeBash(call)
+		result = e.executeBash(call)
 	case "Write":
-		return e.executeWrite(call)
+		result = e.executeWrite(call)
 	case "Edit":
-		return e.executeEdit(call)
+		result = e.executeEdit(call)
 	case "Glob":
-		return e.executeGlob(call)
+		result = e.executeGlob(call)
 	case "Grep":
-		return e.executeGrep(call)
+		result = e.executeGrep(call)
 	// Handle common tool name variations
 	case "google:list_files", "list_files", "ls":
-		return e.executeGlob(ToolCall{ID: call.ID, Name: "Glob", Input: map[string]interface{}{"pattern": "*"}})
+		result = e.executeGlob(ToolCall{ID: call.ID, Name: "Glob", Input: map[string]interface{}{"pattern": "*"}})
 	case "cat", "read_file":
-		return e.executeRead(call)
+		result = e.executeRead(call)
 	default:
-		return ToolResult{
+		result = ToolResult{
 			ToolUseID: call.ID,
 			Content:   fmt.Sprintf("Tool %s not implemented", call.Name),
 			IsError:   true,
 		}
 	}
+	
+	duration := time.Since(startTime)
+	status := "success"
+	if result.IsError {
+		status = "error"
+	}
+	e.logger.Printf("[tools] completed %s (id=%s) in %v - %s", call.Name, call.ID, duration, status)
+	return result
 }
 
 func (e *Executor) executeRead(call ToolCall) ToolResult {
