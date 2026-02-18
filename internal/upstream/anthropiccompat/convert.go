@@ -902,6 +902,148 @@ func getEventType(event interface{}) string {
 	return "unknown"
 }
 
+// WriteAnthropicResponseAsSSE converts a non-streaming Anthropic JSON response
+// into SSE events for clients that requested streaming.
+func WriteAnthropicResponseAsSSE(respBytes []byte, w io.Writer, model string) {
+	var resp struct {
+		ID         string `json:"id"`
+		Model      string `json:"model"`
+		Content    []struct {
+			Type     string          `json:"type"`
+			Text     string          `json:"text,omitempty"`
+			Thinking string          `json:"thinking,omitempty"`
+			ID       string          `json:"id,omitempty"`
+			Name     string          `json:"name,omitempty"`
+			Input    json.RawMessage `json:"input,omitempty"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(respBytes, &resp) != nil {
+		// Fallback: write the raw JSON
+		fmt.Fprintf(w, "data: %s\n\n", string(respBytes))
+		return
+	}
+
+	msgID := resp.ID
+	if msgID == "" {
+		msgID = "msg_proxy"
+	}
+
+	writeSSE(w, map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
+			"model":   model,
+			"content": []interface{}{},
+			"usage": map[string]interface{}{
+				"input_tokens":  resp.Usage.InputTokens,
+				"output_tokens": 0,
+			},
+		},
+	})
+
+	for i, block := range resp.Content {
+		switch block.Type {
+		case "thinking":
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_start",
+				"index": i,
+				"content_block": map[string]interface{}{
+					"type":     "thinking",
+					"thinking": "",
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": i,
+				"delta": map[string]interface{}{
+					"type":     "thinking_delta",
+					"thinking": block.Thinking,
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": i,
+			})
+
+		case "text":
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_start",
+				"index": i,
+				"content_block": map[string]interface{}{
+					"type": "text",
+					"text": "",
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": i,
+				"delta": map[string]interface{}{
+					"type": "text_delta",
+					"text": block.Text,
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": i,
+			})
+
+		case "tool_use":
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_start",
+				"index": i,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    block.ID,
+					"name":  block.Name,
+					"input": map[string]interface{}{},
+				},
+			})
+			inputJSON := string(block.Input)
+			if inputJSON == "" || inputJSON == "null" {
+				inputJSON = "{}"
+			}
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": i,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": inputJSON,
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": i,
+			})
+		}
+	}
+
+	stopReason := resp.StopReason
+	if stopReason == "" {
+		stopReason = "end_turn"
+	}
+
+	writeSSE(w, map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason": stopReason,
+		},
+		"usage": map[string]interface{}{
+			"output_tokens": resp.Usage.OutputTokens,
+		},
+	})
+
+	writeSSE(w, map[string]interface{}{
+		"type": "message_stop",
+	})
+}
+
 func loadCustomSystemMessage() (string, error) {
 	return orchestrator.LoadFullPrompt()
 }

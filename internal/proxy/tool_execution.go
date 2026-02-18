@@ -8,6 +8,7 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/tools"
 	"github.com/rpay/apipod-smart-proxy/internal/upstream/anthropiccompat"
+	"github.com/rpay/apipod-smart-proxy/internal/upstream/openaicompat"
 )
 
 // AnthropicResponse represents a response from the Anthropic API
@@ -195,4 +196,179 @@ func (h *Handler) executeToolContinuationWithRetry(baseURL, apiKey string, reque
 	return nil, lastErr
 }
 
+// OpenAI-format structures for tool execution
+type openAIToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type openAIToolCallEntry struct {
+	ID       string             `json:"id"`
+	Type     string             `json:"type"`
+	Function openAIToolCallFunc `json:"function"`
+}
+
+type openAIChatResponse struct {
+	ID      string `json:"id"`
+	Choices []struct {
+		Message struct {
+			Role      string                `json:"role"`
+			Content   *string               `json:"content"`
+			ToolCalls []openAIToolCallEntry  `json:"tool_calls,omitempty"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+// handleToolExecutionOpenAI intercepts OpenAI-format responses with tool_calls,
+// executes them locally, and sends a follow-up request through the OpenAI-compat endpoint.
+// Returns the final Anthropic-format response bytes, input/output tokens, hasToolCall, and error.
+func (h *Handler) handleToolExecutionOpenAI(openaiRespBytes []byte, routing RoutingResult, openaiRequestBytes []byte, model string, path string) ([]byte, int, int, bool, error) {
+	var response openAIChatResponse
+	if err := json.Unmarshal(openaiRespBytes, &response); err != nil {
+		return nil, 0, 0, false, err
+	}
+
+	// Check if response contains tool_calls
+	if len(response.Choices) == 0 || len(response.Choices[0].Message.ToolCalls) == 0 {
+		// No tool calls — convert to Anthropic format and return
+		anthropicResp, in, out, tc, err := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
+		return anthropicResp, in, out, tc, err
+	}
+
+	hasToolCall := true
+	var toolCalls []tools.ToolCall
+
+	for _, tc := range response.Choices[0].Message.ToolCalls {
+		var input map[string]interface{}
+		if json.Unmarshal([]byte(tc.Function.Arguments), &input) != nil {
+			input = map[string]interface{}{}
+		}
+		toolCalls = append(toolCalls, tools.ToolCall{
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: input,
+		})
+	}
+
+	h.runnerLogger.Printf("[tool_execution] executing %d tools", len(toolCalls))
+
+	// Execute tools
+	var toolResultMsgs []map[string]interface{}
+	for _, call := range toolCalls {
+		h.runnerLogger.Printf("[tools] executing %s with id %s", call.Name, call.ID)
+		result := h.toolExecutor.ExecuteTool(call)
+		h.runnerLogger.Printf("[tool_execution] executed %s: success=%v", call.Name, !result.IsError)
+
+		toolResultMsgs = append(toolResultMsgs, map[string]interface{}{
+			"role":         "tool",
+			"content":      result.Content,
+			"tool_call_id": result.ToolUseID,
+		})
+	}
+
+	// Build follow-up OpenAI request by appending assistant + tool results
+	var originalReq map[string]interface{}
+	if err := json.Unmarshal(openaiRequestBytes, &originalReq); err != nil {
+		anthropicResp, in, out, _, err2 := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
+		if err2 != nil {
+			return openaiRespBytes, response.Usage.PromptTokens, response.Usage.CompletionTokens, hasToolCall, err
+		}
+		return anthropicResp, in, out, hasToolCall, err
+	}
+
+	msgs, _ := originalReq["messages"].([]interface{})
+
+	// Add assistant message with tool_calls
+	assistantMsg := map[string]interface{}{
+		"role":       "assistant",
+		"tool_calls": response.Choices[0].Message.ToolCalls,
+	}
+	if response.Choices[0].Message.Content != nil {
+		assistantMsg["content"] = *response.Choices[0].Message.Content
+	}
+	msgs = append(msgs, assistantMsg)
+
+	// Add tool result messages
+	for _, tr := range toolResultMsgs {
+		msgs = append(msgs, tr)
+	}
+	originalReq["messages"] = msgs
+
+	followupBytes, err := json.Marshal(originalReq)
+	if err != nil {
+		anthropicResp, in, out, _, _ := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
+		return anthropicResp, in, out, hasToolCall, err
+	}
+
+	// Send follow-up request through OpenAI-compat endpoint
+	apiKey := h.resolveAPIKey(routing)
+	timeouts := config.GetModelTimeouts(routing.Model)
+
+	followupRespBytes, err := h.executeToolContinuationOpenAIWithRetry(routing.BaseURL, apiKey, path, followupBytes, timeouts, routing.Model)
+	if err != nil {
+		h.runnerLogger.Printf("[tool_execution] follow-up request failed: %v", err)
+		anthropicResp, in, out, _, _ := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
+		return anthropicResp, in, out, hasToolCall, err
+	}
+
+	// Convert follow-up OpenAI response to Anthropic format
+	anthropicResp, in2, out2, tc2, err := anthropiccompat.OpenAIResponseToAnthropic(followupRespBytes, model)
+	if err != nil {
+		return followupRespBytes, response.Usage.PromptTokens, response.Usage.CompletionTokens, hasToolCall, err
+	}
+
+	totalIn := response.Usage.PromptTokens + in2
+	totalOut := response.Usage.CompletionTokens + out2
+
+	h.runnerLogger.Printf("[tool_execution] completed with %d input + %d output tokens", totalIn, totalOut)
+
+	return anthropicResp, totalIn, totalOut, hasToolCall || tc2, nil
+}
+
+// executeToolContinuationOpenAIWithRetry sends a follow-up request to an OpenAI-compat endpoint with retry logic.
+func (h *Handler) executeToolContinuationOpenAIWithRetry(baseURL, apiKey, path string, requestBytes []byte, timeouts config.ModelTimeouts, model string) ([]byte, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= timeouts.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(attempt) * timeouts.RetryDelay
+			h.runnerLogger.Printf("[tool_execution] retry %d/%d for model=%s, waiting %v", attempt, timeouts.MaxRetries, model, delay)
+			time.Sleep(delay)
+		}
+
+		resp, err := openaicompat.Proxy(baseURL, apiKey, path, requestBytes)
+		if err != nil {
+			lastErr = err
+			h.runnerLogger.Printf("[tool_execution] attempt %d failed for model=%s: %v", attempt+1, model, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 500 {
+			lastErr = err
+			h.runnerLogger.Printf("[tool_execution] server error %d on attempt %d for model=%s", resp.StatusCode, attempt+1, model)
+			continue
+		} else if resp.StatusCode >= 400 {
+			respBody, _ := io.ReadAll(resp.Body)
+			h.runnerLogger.Printf("[tool_execution] client error %d for model=%s: %s", resp.StatusCode, model, string(respBody))
+			return respBody, err
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		h.runnerLogger.Printf("[tool_execution] successful continuation on attempt %d for model=%s", attempt+1, model)
+		return respBody, nil
+	}
+
+	return nil, lastErr
+}
 
