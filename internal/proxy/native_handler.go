@@ -295,6 +295,9 @@ func (h *Handler) handleAntigravityFromAnthropic(w http.ResponseWriter, r *http.
 
 	bodyBytes = h.orchestrateOrFallback(bodyBytes, routing, username)
 
+	// Sanitize empty tool names before forwarding
+	bodyBytes = anthropiccompat.SanitizeEmptyToolNames(bodyBytes)
+
 	apiKey := h.resolveAPIKey(routing)
 
 	// Use model-specific timeout for initial request
@@ -378,6 +381,9 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 	// Deduplicate tool_result blocks with the same tool_use_id
 	// The upstream OpenAI-compatible endpoint rejects duplicate tool_call_id values
 	bodyBytes = anthropiccompat.DeduplicateToolResults(bodyBytes)
+
+	// Sanitize empty tool names before forwarding
+	bodyBytes = anthropiccompat.SanitizeEmptyToolNames(bodyBytes)
 
 	resp, upstreamURL, err := copilot.ProxyToCopilot(routing.BaseURL, routing.APIKey, routing.Model, bodyBytes, req.Stream)
 	if err != nil {

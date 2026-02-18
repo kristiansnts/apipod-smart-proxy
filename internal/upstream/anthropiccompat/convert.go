@@ -81,6 +81,104 @@ type OpenAIMessage struct {
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
 }
 
+// SanitizeEmptyToolNames replaces empty tool_use names and their corresponding
+// tool_result references with a placeholder "_unknown" to prevent upstream
+// APIs (Gemini, OpenAI) from rejecting the request.
+func SanitizeEmptyToolNames(bodyBytes []byte) []byte {
+	var req struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if json.Unmarshal(bodyBytes, &req) != nil {
+		return bodyBytes
+	}
+
+	// First pass: find tool_use blocks with empty names and assign a placeholder
+	type toolUseBlock struct {
+		Type  string `json:"type"`
+		ID    string `json:"id,omitempty"`
+		Name  string `json:"name,omitempty"`
+	}
+
+	emptyNameIDs := make(map[string]bool)
+	modified := false
+
+	for _, rawMsg := range req.Messages {
+		var msg struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(rawMsg, &msg) != nil {
+			continue
+		}
+		var blocks []toolUseBlock
+		if json.Unmarshal(msg.Content, &blocks) != nil {
+			continue
+		}
+		for _, b := range blocks {
+			if b.Type == "tool_use" && b.Name == "" && b.ID != "" {
+				emptyNameIDs[b.ID] = true
+				modified = true
+			}
+		}
+	}
+
+	if !modified {
+		return bodyBytes
+	}
+
+	// Second pass: patch the body
+	var fullReq map[string]interface{}
+	if json.Unmarshal(bodyBytes, &fullReq) != nil {
+		return bodyBytes
+	}
+
+	msgs, ok := fullReq["messages"].([]interface{})
+	if !ok {
+		return bodyBytes
+	}
+
+	for _, rawMsg := range msgs {
+		msgMap, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		contentArr, ok := msgMap["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, block := range contentArr {
+			blockMap, ok := block.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			bType, _ := blockMap["type"].(string)
+			if bType == "tool_use" {
+				name, _ := blockMap["name"].(string)
+				if name == "" {
+					blockMap["name"] = "_unknown"
+				}
+			}
+			if bType == "tool_result" {
+				toolUseID, _ := blockMap["tool_use_id"].(string)
+				if emptyNameIDs[toolUseID] {
+					if _, hasName := blockMap["name"]; hasName {
+						name, _ := blockMap["name"].(string)
+						if name == "" {
+							blockMap["name"] = "_unknown"
+						}
+					}
+				}
+			}
+		}
+	}
+
+	result, err := json.Marshal(fullReq)
+	if err != nil {
+		return bodyBytes
+	}
+	return result
+}
+
 func DeduplicateToolResults(bodyBytes []byte) []byte {
 	var req struct {
 		Messages []json.RawMessage `json:"messages"`
@@ -307,6 +405,10 @@ func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 			if argsBytes == nil {
 				argsBytes = []byte("{}")
 			}
+			name := b.Name
+			if name == "" {
+				name = "_unknown"
+			}
 			toolCalls = append(toolCalls, OpenAIToolCall{
 				ID:   b.ID,
 				Type: "function",
@@ -314,7 +416,7 @@ func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
 				}{
-					Name:      b.Name,
+					Name:      name,
 					Arguments: string(argsBytes),
 				},
 			})
