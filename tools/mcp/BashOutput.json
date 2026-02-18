@@ -1,6 +1,6 @@
 {
   "name": "BashOutput",
-  "description": "\n- Retrieves output from a running or completed background bash shell\n- Takes a shell_id parameter identifying the shell\n- Always returns only new output since the last check\n- Returns stdout and stderr output along with shell status\n- Supports optional regex filtering to show only lines matching a pattern\n- Use this tool when you need to monitor or check the output of a long-running shell\n- Shell IDs can be found using the /bashes command\n",
+  "description": "Retrieve output from background bash shells. Use shell_id to identify shell.",
   "input_schema": {
     "type": "object",
     "properties": {
