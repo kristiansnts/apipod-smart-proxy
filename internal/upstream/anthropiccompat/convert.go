@@ -492,6 +492,68 @@ func convertAnthropicToolsToOpenAI(tools []interface{}) []interface{} {
 	return openaiTools
 }
 
+// splitThinkingFromContent separates reasoning/thinking text from actual response content.
+// Models like Llama/Nemotron put their reasoning in regular content instead of reasoning_content.
+// This splits it so Claude Code can render thinking as collapsible/italic.
+func splitThinkingFromContent(content string) (thinking, text string) {
+	// If content has <think>...</think> tags, use those
+	if idx := strings.Index(content, "<think>"); idx >= 0 {
+		if end := strings.Index(content, "</think>"); end > idx {
+			thinking = strings.TrimSpace(content[idx+7 : end])
+			text = strings.TrimSpace(content[:idx] + content[end+8:])
+			return
+		}
+	}
+
+	// Detect reasoning patterns: lines that start with reasoning phrases
+	lines := strings.Split(content, "\n")
+	reasoningPhrases := []string{
+		"i need to", "i should", "let me", "first,", "wait,",
+		"looking at", "the user", "the assistant", "so,", "hmm,",
+		"okay,", "the correct approach", "the problem", "the task",
+		"the next step", "another thing", "also,", "for example,",
+		"each todo", "each of these", "once the", "since the",
+		"i'll ", "i will ", "let's ", "so i ", "but the ",
+		"now,", "then,", "however,", "in particular,",
+	}
+
+	// Find where reasoning ends and actual response begins
+	lastReasoningLine := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(strings.ToLower(line))
+		if trimmed == "" {
+			continue
+		}
+		isReasoning := false
+		for _, phrase := range reasoningPhrases {
+			if strings.HasPrefix(trimmed, phrase) {
+				isReasoning = true
+				break
+			}
+		}
+		if isReasoning {
+			lastReasoningLine = i
+		} else if lastReasoningLine >= 0 {
+			// Non-reasoning line after reasoning — this is the split point
+			break
+		}
+	}
+
+	if lastReasoningLine < 0 {
+		// No reasoning detected
+		return "", content
+	}
+
+	// Only split if reasoning is substantial (3+ lines)
+	if lastReasoningLine < 2 {
+		return "", content
+	}
+
+	thinking = strings.TrimSpace(strings.Join(lines[:lastReasoningLine+1], "\n"))
+	text = strings.TrimSpace(strings.Join(lines[lastReasoningLine+1:], "\n"))
+	return
+}
+
 func extractSystemText(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
@@ -575,10 +637,19 @@ func OpenAIResponseToAnthropic(body []byte, model string) ([]byte, int, int, boo
 		}
 
 		if choice.Message.Content != nil && *choice.Message.Content != "" {
-			contentBlocks = append(contentBlocks, map[string]interface{}{
-				"type": "text",
-				"text": *choice.Message.Content,
-			})
+			thinking, text := splitThinkingFromContent(*choice.Message.Content)
+			if thinking != "" {
+				contentBlocks = append(contentBlocks, map[string]interface{}{
+					"type":     "thinking",
+					"thinking": thinking,
+				})
+			}
+			if text != "" {
+				contentBlocks = append(contentBlocks, map[string]interface{}{
+					"type": "text",
+					"text": text,
+				})
+			}
 		}
 
 		for _, tc := range choice.Message.ToolCalls {
