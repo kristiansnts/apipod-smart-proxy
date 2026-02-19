@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/admin"
+	"github.com/rpay/apipod-smart-proxy/internal/auth"
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
@@ -56,10 +57,21 @@ func main() {
 
 	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger, modelLimiter)
 
+	// Device auth for CLI login
+	deviceStore := auth.NewDeviceStore()
+	verificationURL := os.Getenv("DASHBOARD_URL")
+	if verificationURL == "" {
+		verificationURL = "https://apipod.net"
+	}
+	deviceAuthHandler := auth.NewHandler(deviceStore, verificationURL+"/auth/device")
+
 	// Setup HTTP routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", proxy.HealthCheck)
 	mux.HandleFunc("/admin/create-key", adminHandler.CreateAPIKey)
+	mux.HandleFunc("/auth/device/code", deviceAuthHandler.HandleDeviceCode)
+	mux.HandleFunc("/auth/device/token", deviceAuthHandler.HandleDeviceToken)
+	mux.HandleFunc("/auth/device/authorize", deviceAuthHandler.HandleAuthorize)
 	mux.Handle("/v1/chat/completions",
 		loggingMiddleware.LogRequest(
 			authMiddleware.Authenticate(
@@ -82,6 +94,9 @@ func main() {
 		logger.Println("Routes:")
 		logger.Println("  GET  /health                 - Health check")
 		logger.Println("  POST /admin/create-key       - Create API token (x-admin-secret required)")
+		logger.Println("  POST /auth/device/code       - Request device login code")
+		logger.Println("  POST /auth/device/token      - Poll device login status")
+		logger.Println("  POST /auth/device/authorize   - Authorize device code (dashboard)")
 		logger.Println("  POST /v1/chat/completions    - Chat completions (Bearer token required)")
 		logger.Println("  POST /v1/messages            - Anthropic Messages API (x-api-key or Bearer token)")
 		logger.Println("")
