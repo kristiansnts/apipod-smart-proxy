@@ -8,9 +8,10 @@ import (
 )
 
 type Config struct {
-	Port        string
-	DatabaseURL string
-	AdminSecret string
+	Port         string
+	DatabaseURL  string
+	AdminSecret  string
+	DashboardURL string
 }
 
 func Load() (*Config, error) {
@@ -31,9 +32,15 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ADMIN_SECRET not set")
 	}
 
+	dashboardURL := os.Getenv("DASHBOARD_URL")
+	if dashboardURL == "" {
+		dashboardURL = "http://localhost:8000"
+	}
+
 	return &Config{
-		Port:        port,
-		DatabaseURL: databaseURL,
-		AdminSecret: adminSecret,
+		Port:         port,
+		DatabaseURL:  databaseURL,
+		AdminSecret:  adminSecret,
+		DashboardURL: dashboardURL,
 	}, nil
 }
