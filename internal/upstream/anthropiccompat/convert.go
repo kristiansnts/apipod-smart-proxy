@@ -311,6 +311,7 @@ func AnthropicToOpenAI(body []byte) ([]byte, bool, error) {
 		tools, err := loadMCPToolsForOpenAI()
 		if err == nil && len(tools) > 0 {
 			openaiReq["tools"] = tools
+			openaiReq["tool_choice"] = "auto"
 		}
 	}
 
@@ -491,6 +492,68 @@ func convertAnthropicToolsToOpenAI(tools []interface{}) []interface{} {
 	return openaiTools
 }
 
+// splitThinkingFromContent separates reasoning/thinking text from actual response content.
+// Models like Llama/Nemotron put their reasoning in regular content instead of reasoning_content.
+// This splits it so Claude Code can render thinking as collapsible/italic.
+func splitThinkingFromContent(content string) (thinking, text string) {
+	// If content has <think>...</think> tags, use those
+	if idx := strings.Index(content, "<think>"); idx >= 0 {
+		if end := strings.Index(content, "</think>"); end > idx {
+			thinking = strings.TrimSpace(content[idx+7 : end])
+			text = strings.TrimSpace(content[:idx] + content[end+8:])
+			return
+		}
+	}
+
+	// Detect reasoning patterns: lines that start with reasoning phrases
+	lines := strings.Split(content, "\n")
+	reasoningPhrases := []string{
+		"i need to", "i should", "let me", "first,", "wait,",
+		"looking at", "the user", "the assistant", "so,", "hmm,",
+		"okay,", "the correct approach", "the problem", "the task",
+		"the next step", "another thing", "also,", "for example,",
+		"each todo", "each of these", "once the", "since the",
+		"i'll ", "i will ", "let's ", "so i ", "but the ",
+		"now,", "then,", "however,", "in particular,",
+	}
+
+	// Find where reasoning ends and actual response begins
+	lastReasoningLine := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(strings.ToLower(line))
+		if trimmed == "" {
+			continue
+		}
+		isReasoning := false
+		for _, phrase := range reasoningPhrases {
+			if strings.HasPrefix(trimmed, phrase) {
+				isReasoning = true
+				break
+			}
+		}
+		if isReasoning {
+			lastReasoningLine = i
+		} else if lastReasoningLine >= 0 {
+			// Non-reasoning line after reasoning — this is the split point
+			break
+		}
+	}
+
+	if lastReasoningLine < 0 {
+		// No reasoning detected
+		return "", content
+	}
+
+	// Only split if reasoning is substantial (3+ lines)
+	if lastReasoningLine < 2 {
+		return "", content
+	}
+
+	thinking = strings.TrimSpace(strings.Join(lines[:lastReasoningLine+1], "\n"))
+	text = strings.TrimSpace(strings.Join(lines[lastReasoningLine+1:], "\n"))
+	return
+}
+
 func extractSystemText(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
@@ -574,10 +637,19 @@ func OpenAIResponseToAnthropic(body []byte, model string) ([]byte, int, int, boo
 		}
 
 		if choice.Message.Content != nil && *choice.Message.Content != "" {
-			contentBlocks = append(contentBlocks, map[string]interface{}{
-				"type": "text",
-				"text": *choice.Message.Content,
-			})
+			thinking, text := splitThinkingFromContent(*choice.Message.Content)
+			if thinking != "" {
+				contentBlocks = append(contentBlocks, map[string]interface{}{
+					"type":     "thinking",
+					"thinking": thinking,
+				})
+			}
+			if text != "" {
+				contentBlocks = append(contentBlocks, map[string]interface{}{
+					"type": "text",
+					"text": text,
+				})
+			}
 		}
 
 		for _, tc := range choice.Message.ToolCalls {
@@ -902,6 +974,148 @@ func getEventType(event interface{}) string {
 	return "unknown"
 }
 
+// WriteAnthropicResponseAsSSE converts a non-streaming Anthropic JSON response
+// into SSE events for clients that requested streaming.
+func WriteAnthropicResponseAsSSE(respBytes []byte, w io.Writer, model string) {
+	var resp struct {
+		ID         string `json:"id"`
+		Model      string `json:"model"`
+		Content    []struct {
+			Type     string          `json:"type"`
+			Text     string          `json:"text,omitempty"`
+			Thinking string          `json:"thinking,omitempty"`
+			ID       string          `json:"id,omitempty"`
+			Name     string          `json:"name,omitempty"`
+			Input    json.RawMessage `json:"input,omitempty"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(respBytes, &resp) != nil {
+		// Fallback: write the raw JSON
+		fmt.Fprintf(w, "data: %s\n\n", string(respBytes))
+		return
+	}
+
+	msgID := resp.ID
+	if msgID == "" {
+		msgID = "msg_proxy"
+	}
+
+	writeSSE(w, map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
+			"model":   model,
+			"content": []interface{}{},
+			"usage": map[string]interface{}{
+				"input_tokens":  resp.Usage.InputTokens,
+				"output_tokens": 0,
+			},
+		},
+	})
+
+	for i, block := range resp.Content {
+		switch block.Type {
+		case "thinking":
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_start",
+				"index": i,
+				"content_block": map[string]interface{}{
+					"type":     "thinking",
+					"thinking": "",
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": i,
+				"delta": map[string]interface{}{
+					"type":     "thinking_delta",
+					"thinking": block.Thinking,
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": i,
+			})
+
+		case "text":
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_start",
+				"index": i,
+				"content_block": map[string]interface{}{
+					"type": "text",
+					"text": "",
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": i,
+				"delta": map[string]interface{}{
+					"type": "text_delta",
+					"text": block.Text,
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": i,
+			})
+
+		case "tool_use":
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_start",
+				"index": i,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    block.ID,
+					"name":  block.Name,
+					"input": map[string]interface{}{},
+				},
+			})
+			inputJSON := string(block.Input)
+			if inputJSON == "" || inputJSON == "null" {
+				inputJSON = "{}"
+			}
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": i,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": inputJSON,
+				},
+			})
+			writeSSE(w, map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": i,
+			})
+		}
+	}
+
+	stopReason := resp.StopReason
+	if stopReason == "" {
+		stopReason = "end_turn"
+	}
+
+	writeSSE(w, map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason": stopReason,
+		},
+		"usage": map[string]interface{}{
+			"output_tokens": resp.Usage.OutputTokens,
+		},
+	})
+
+	writeSSE(w, map[string]interface{}{
+		"type": "message_stop",
+	})
+}
+
 func loadCustomSystemMessage() (string, error) {
 	return orchestrator.LoadFullPrompt()
 }
@@ -1098,4 +1312,238 @@ func InjectSystemMessageOrchestrated(bodyBytes []byte, model string, intent stri
 func mustMarshal(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// Regex patterns for extracting tool calls from text
+var (
+	hermesToolCallRe = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
+	jsonToolBlockRe  = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{[^`]*?\"name\"\\s*:[^`]*?\\})\\s*```")
+)
+
+// ExtractToolCallsFromText detects tool calls embedded as text in an OpenAI response
+// (e.g., Hermes-style <tool_call> tags or JSON blocks) and converts them into proper
+// tool_calls entries. This handles models that don't natively emit structured tool_calls.
+func ExtractToolCallsFromText(respBody []byte) []byte {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return respBody
+	}
+
+	choices, ok := resp["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return respBody
+	}
+
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return respBody
+	}
+
+	message, ok := choice["message"].(map[string]interface{})
+	if !ok {
+		return respBody
+	}
+
+	// Already has tool_calls — nothing to do
+	if tc, has := message["tool_calls"]; has {
+		if arr, ok := tc.([]interface{}); ok && len(arr) > 0 {
+			return respBody
+		}
+	}
+
+	content, ok := message["content"].(string)
+	if !ok || content == "" {
+		return respBody
+	}
+
+	// Try extracting tool calls from text
+	toolCalls := extractHermesToolCalls(content)
+	if len(toolCalls) == 0 {
+		toolCalls = extractJSONBlockToolCalls(content)
+	}
+	if len(toolCalls) == 0 {
+		toolCalls = extractInlineJSONToolCalls(content)
+	}
+	if len(toolCalls) == 0 {
+		return respBody
+	}
+
+	// Modify response: add tool_calls, update finish_reason
+	message["tool_calls"] = toolCalls
+	message["content"] = nil
+	choice["finish_reason"] = "tool_calls"
+
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return respBody
+	}
+	return out
+}
+
+// extractHermesToolCalls parses <tool_call>{"name":"...","arguments":{...}}</tool_call> patterns
+func extractHermesToolCalls(text string) []interface{} {
+	matches := hermesToolCallRe.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	var toolCalls []interface{}
+	for i, match := range matches {
+		var call map[string]interface{}
+		if err := json.Unmarshal([]byte(match[1]), &call); err != nil {
+			continue
+		}
+
+		name, _ := call["name"].(string)
+		if name == "" {
+			continue
+		}
+
+		argsStr := "{}"
+		if args, ok := call["arguments"]; ok {
+			if b, err := json.Marshal(args); err == nil {
+				argsStr = string(b)
+			}
+		} else if params, ok := call["parameters"]; ok {
+			if b, err := json.Marshal(params); err == nil {
+				argsStr = string(b)
+			}
+		}
+
+		toolCalls = append(toolCalls, map[string]interface{}{
+			"id":   fmt.Sprintf("call_text_%d", i),
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      name,
+				"arguments": argsStr,
+			},
+		})
+	}
+	return toolCalls
+}
+
+// extractJSONBlockToolCalls parses ```json {"name":"...","arguments":{...}} ``` code blocks
+func extractJSONBlockToolCalls(text string) []interface{} {
+	matches := jsonToolBlockRe.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	var toolCalls []interface{}
+	for i, match := range matches {
+		tc := tryParseToolCallJSON(match[1], i)
+		if tc != nil {
+			toolCalls = append(toolCalls, tc)
+		}
+	}
+	return toolCalls
+}
+
+// extractInlineJSONToolCalls looks for standalone JSON objects with "name" + "arguments"/"input" in text
+func extractInlineJSONToolCalls(text string) []interface{} {
+	// Look for JSON objects that have a "name" field — scan for { and try to parse
+	var toolCalls []interface{}
+	idx := 0
+	for idx < len(text) {
+		start := strings.Index(text[idx:], "{")
+		if start == -1 {
+			break
+		}
+		start += idx
+
+		// Try to find matching brace
+		jsonStr := extractBalancedJSON(text[start:])
+		if jsonStr == "" {
+			idx = start + 1
+			continue
+		}
+
+		tc := tryParseToolCallJSON(jsonStr, len(toolCalls))
+		if tc != nil {
+			toolCalls = append(toolCalls, tc)
+		}
+		idx = start + len(jsonStr)
+	}
+	return toolCalls
+}
+
+// tryParseToolCallJSON tries to parse a JSON string as a tool call
+func tryParseToolCallJSON(jsonStr string, index int) interface{} {
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
+		return nil
+	}
+
+	name, _ := obj["name"].(string)
+	if name == "" {
+		return nil
+	}
+
+	// Must have arguments, input, or parameters to be a tool call
+	argsStr := "{}"
+	for _, key := range []string{"arguments", "input", "parameters"} {
+		if args, ok := obj[key]; ok {
+			if b, err := json.Marshal(args); err == nil {
+				argsStr = string(b)
+				break
+			}
+		}
+	}
+
+	// Only treat as tool call if it had an args-like field
+	hasArgs := false
+	for _, key := range []string{"arguments", "input", "parameters"} {
+		if _, ok := obj[key]; ok {
+			hasArgs = true
+			break
+		}
+	}
+	if !hasArgs {
+		return nil
+	}
+
+	return map[string]interface{}{
+		"id":   fmt.Sprintf("call_text_%d", index),
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":      name,
+			"arguments": argsStr,
+		},
+	}
+}
+
+// extractBalancedJSON extracts a balanced JSON object starting with {
+func extractBalancedJSON(text string) string {
+	if len(text) == 0 || text[0] != '{' {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i, c := range text {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return text[:i+1]
+			}
+		}
+	}
+	return ""
 }

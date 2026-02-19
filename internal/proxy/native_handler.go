@@ -410,12 +410,25 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 
 // handleOpenAICompatFromAnthropic converts Anthropic→OpenAI, proxies, then converts response back to Anthropic.
 func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte, startTime time.Time, username string) {
+	// Check if this is a Claude Code request (client handles tools) vs proxy-injected tools
+	isClaudeCode := anthropiccompat.IsClaudeCodeRequest(bodyBytes)
+
 	// Convert Anthropic request to OpenAI format
 	openaiBody, isStream, err := anthropiccompat.AnthropicToOpenAI(bodyBytes)
 	if err != nil {
 		h.logger.Printf("[%s/anthropic] conversion error: %v", routing.ProviderType, err)
 		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
 		return
+	}
+
+	// For proxy-injected tools, force non-streaming so tool execution works server-side
+	needsToolExecution := !isClaudeCode
+	if needsToolExecution && isStream {
+		var body2 map[string]interface{}
+		json.Unmarshal(openaiBody, &body2)
+		body2["stream"] = false
+		delete(body2, "stream_options")
+		openaiBody, _ = json.Marshal(body2)
 	}
 
 	// Replace model with routed model
@@ -461,23 +474,54 @@ func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http
 	var inputTokens, outputTokens int
 	hasToolCall := false
 
-	if isStream {
+	if isStream && !needsToolExecution {
+		// Claude Code client with streaming — pass through directly
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		inputTokens, outputTokens, hasToolCall = anthropiccompat.OpenAIStreamToAnthropicStream(resp.Body, w, routing.Model)
 	} else {
+		// Non-streaming (or forced non-streaming for tool execution)
 		respBody, _ := io.ReadAll(resp.Body)
-		anthropicResp, in, out, tc, err := anthropiccompat.OpenAIResponseToAnthropic(respBody, routing.Model)
-		if err != nil {
+
+		if needsToolExecution {
+			// Execute tools if present and get Anthropic-format response
+			anthropicResp, in, out, tc, err := h.handleToolExecutionOpenAI(respBody, routing, openaiBody, routing.Model, path)
+			if err != nil {
+				h.runnerLogger.Printf("ERROR [tool_execution] model=%s err=%v", routing.Model, err)
+				// Fall back to direct conversion
+				anthropicResp, in, out, tc, err = anthropiccompat.OpenAIResponseToAnthropic(respBody, routing.Model)
+				if err != nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(resp.StatusCode)
+					w.Write(respBody)
+					return
+				}
+			}
+			inputTokens, outputTokens, hasToolCall = in, out, tc
+
+			if isStream {
+				// Client requested streaming — send as Anthropic SSE events
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				anthropiccompat.WriteAnthropicResponseAsSSE(anthropicResp, w, routing.Model)
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write(anthropicResp)
+			}
+		} else {
+			anthropicResp, in, out, tc, err := anthropiccompat.OpenAIResponseToAnthropic(respBody, routing.Model)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				w.Write(respBody)
+				return
+			}
+			inputTokens, outputTokens, hasToolCall = in, out, tc
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			w.Write(respBody)
-			return
+			w.WriteHeader(http.StatusOK)
+			w.Write(anthropicResp)
 		}
-		inputTokens, outputTokens, hasToolCall = in, out, tc
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(anthropicResp)
 	}
 
 	h.runnerLogger.Printf("OK [%s/anthropic] model=%s stream=%v tool_call=%v tokens=%d/%d latency=%s user=%s req_size=%d",
