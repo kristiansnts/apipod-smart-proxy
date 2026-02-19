@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/config"
@@ -42,109 +43,104 @@ type AnthropicRequest struct {
 
 // handleToolExecution intercepts responses with tool_use and executes them
 func (h *Handler) handleToolExecution(respBytes []byte, routing RoutingResult, originalRequest []byte) ([]byte, int, int, error) {
-	var response AnthropicResponse
-	if err := json.Unmarshal(respBytes, &response); err != nil {
+	const maxToolRounds = 15
+
+	totalInputTokens := 0
+	totalOutputTokens := 0
+
+	// Parse original request to accumulate messages
+	var currentReq AnthropicRequest
+	if err := json.Unmarshal(originalRequest, &currentReq); err != nil {
 		return respBytes, 0, 0, err
 	}
 
-	// Check if response contains tool_use
-	hasTools := false
-	var toolCalls []tools.ToolCall
-	
-	for _, content := range response.Content {
-		if content.Type == "tool_use" {
-			hasTools = true
-			toolCalls = append(toolCalls, tools.ToolCall{
-				ID:    content.ID,
-				Name:  content.Name,
-				Input: content.Input,
+	currentRespBytes := respBytes
+
+	for round := 0; round < maxToolRounds; round++ {
+		var response AnthropicResponse
+		if err := json.Unmarshal(currentRespBytes, &response); err != nil {
+			break
+		}
+
+		totalInputTokens += response.Usage.InputTokens
+		totalOutputTokens += response.Usage.OutputTokens
+
+		// Check if response contains tool_use
+		var toolCalls []tools.ToolCall
+		for _, content := range response.Content {
+			if content.Type == "tool_use" {
+				toolCalls = append(toolCalls, tools.ToolCall{
+					ID:    content.ID,
+					Name:  content.Name,
+					Input: content.Input,
+				})
+			}
+		}
+
+		if len(toolCalls) == 0 {
+			return currentRespBytes, totalInputTokens, totalOutputTokens, nil
+		}
+
+		h.runnerLogger.Printf("[tool_execution] round %d: executing %d tools", round+1, len(toolCalls))
+
+		// Execute tools
+		var toolResults []map[string]interface{}
+		for i, call := range toolCalls {
+			h.runnerLogger.Printf("[tool_execution] executing tool %d/%d: %s (id=%s)", i+1, len(toolCalls), call.Name, call.ID)
+			result := h.toolExecutor.ExecuteTool(call)
+			h.runnerLogger.Printf("[tool_execution] completed tool %d/%d: %s success=%v", i+1, len(toolCalls), call.Name, !result.IsError)
+
+			toolResults = append(toolResults, map[string]interface{}{
+				"type":        "tool_result",
+				"tool_use_id": result.ToolUseID,
+				"content":     result.Content,
+				"is_error":    result.IsError,
 			})
 		}
-	}
 
-	if !hasTools {
-		return respBytes, response.Usage.InputTokens, response.Usage.OutputTokens, nil
-	}
+		// Add assistant message with tool_use
+		assistantContent := []map[string]interface{}{}
+		for _, content := range response.Content {
+			assistantContent = append(assistantContent, map[string]interface{}{
+				"type":  content.Type,
+				"text":  content.Text,
+				"id":    content.ID,
+				"name":  content.Name,
+				"input": content.Input,
+			})
+		}
 
-	h.runnerLogger.Printf("[tool_execution] executing %d tools", len(toolCalls))
-
-	// Execute tools with progress logging
-	var toolResults []map[string]interface{}
-	for i, call := range toolCalls {
-		h.runnerLogger.Printf("[tool_execution] executing tool %d/%d: %s (id=%s)", i+1, len(toolCalls), call.Name, call.ID)
-		
-		result := h.toolExecutor.ExecuteTool(call)
-		h.runnerLogger.Printf("[tool_execution] completed tool %d/%d: %s success=%v", i+1, len(toolCalls), call.Name, !result.IsError)
-		
-		toolResults = append(toolResults, map[string]interface{}{
-			"type":        "tool_result",
-			"tool_use_id": result.ToolUseID,
-			"content":     result.Content,
-			"is_error":    result.IsError,
+		currentReq.Messages = append(currentReq.Messages, map[string]interface{}{
+			"role":    "assistant",
+			"content": assistantContent,
 		})
-	}
 
-	// Parse original request to continue conversation
-	var originalReq AnthropicRequest
-	if err := json.Unmarshal(originalRequest, &originalReq); err != nil {
-		return respBytes, response.Usage.InputTokens, response.Usage.OutputTokens, err
-	}
-
-	// Add assistant message with tool_use
-	assistantContent := []map[string]interface{}{}
-	for _, content := range response.Content {
-		assistantContent = append(assistantContent, map[string]interface{}{
-			"type":  content.Type,
-			"text":  content.Text,
-			"id":    content.ID,
-			"name":  content.Name,
-			"input": content.Input,
+		// Add tool results as user message
+		currentReq.Messages = append(currentReq.Messages, map[string]interface{}{
+			"role":    "user",
+			"content": toolResults,
 		})
+
+		// Make follow-up request
+		followupBytes, err := json.Marshal(currentReq)
+		if err != nil {
+			break
+		}
+
+		apiKey := h.resolveAPIKey(routing)
+		timeouts := config.GetModelTimeouts(routing.Model)
+
+		followupRespBytes, err := h.executeToolContinuationWithRetry(routing.BaseURL, apiKey, followupBytes, timeouts, routing.Model)
+		if err != nil {
+			h.runnerLogger.Printf("[tool_execution] follow-up request failed at round %d: %v", round+1, err)
+			break
+		}
+
+		currentRespBytes = followupRespBytes
 	}
 
-	originalReq.Messages = append(originalReq.Messages, map[string]interface{}{
-		"role":    "assistant",
-		"content": assistantContent,
-	})
-
-	// Add tool results as user message
-	originalReq.Messages = append(originalReq.Messages, map[string]interface{}{
-		"role":    "user", 
-		"content": toolResults,
-	})
-
-	// Make follow-up request
-	followupBytes, err := json.Marshal(originalReq)
-	if err != nil {
-		return respBytes, response.Usage.InputTokens, response.Usage.OutputTokens, err
-	}
-
-	// Get API key for follow-up request
-	apiKey := h.resolveAPIKey(routing)
-	
-	// Get model-specific timeouts and retry configuration
-	timeouts := config.GetModelTimeouts(routing.Model)
-	
-	followupBytes, err = h.executeToolContinuationWithRetry(routing.BaseURL, apiKey, followupBytes, timeouts, routing.Model)
-	if err != nil {
-		h.runnerLogger.Printf("[tool_execution] follow-up request failed after retries: %v", err)
-		return respBytes, response.Usage.InputTokens, response.Usage.OutputTokens, err
-	}
-
-	// Parse follow-up response for token counting
-	var followupResponse AnthropicResponse
-	totalInputTokens := response.Usage.InputTokens
-	totalOutputTokens := response.Usage.OutputTokens
-	
-	if json.Unmarshal(followupBytes, &followupResponse) == nil {
-		totalInputTokens += followupResponse.Usage.InputTokens
-		totalOutputTokens += followupResponse.Usage.OutputTokens
-	}
-
-	h.runnerLogger.Printf("[tool_execution] completed with %d input + %d output tokens", 
-		totalInputTokens, totalOutputTokens)
-
-	return followupBytes, totalInputTokens, totalOutputTokens, nil
+	h.runnerLogger.Printf("[tool_execution] completed with %d input + %d output tokens", totalInputTokens, totalOutputTokens)
+	return currentRespBytes, totalInputTokens, totalOutputTokens, nil
 }
 
 // executeToolContinuationWithRetry executes a tool continuation request with retry logic and exponential backoff
@@ -228,110 +224,173 @@ type openAIChatResponse struct {
 // executes them locally, and sends a follow-up request through the OpenAI-compat endpoint.
 // Returns the final Anthropic-format response bytes, input/output tokens, hasToolCall, and error.
 func (h *Handler) handleToolExecutionOpenAI(openaiRespBytes []byte, routing RoutingResult, openaiRequestBytes []byte, model string, path string) ([]byte, int, int, bool, error) {
+	const maxToolRounds = 15
+	const maxThinkingRetries = 2
+	const thinkingThreshold = 500 // chars of text that looks like reasoning about tools
+
 	// Try to extract tool calls from text for models that don't emit structured tool_calls
 	openaiRespBytes = anthropiccompat.ExtractToolCallsFromText(openaiRespBytes)
 
-	var response openAIChatResponse
-	if err := json.Unmarshal(openaiRespBytes, &response); err != nil {
-		return nil, 0, 0, false, err
-	}
+	totalInputTokens := 0
+	totalOutputTokens := 0
+	hasToolCall := false
 
-	// Check if response contains tool_calls
-	if len(response.Choices) == 0 || len(response.Choices[0].Message.ToolCalls) == 0 {
-		// No tool calls — convert to Anthropic format and return
-		anthropicResp, in, out, tc, err := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
-		return anthropicResp, in, out, tc, err
-	}
-
-	hasToolCall := true
-	h.runnerLogger.Printf("[tool_execution] extracted %d tool calls from model=%s", len(response.Choices[0].Message.ToolCalls), model)
-	var toolCalls []tools.ToolCall
-
-	for _, tc := range response.Choices[0].Message.ToolCalls {
-		var input map[string]interface{}
-		if json.Unmarshal([]byte(tc.Function.Arguments), &input) != nil {
-			input = map[string]interface{}{}
-		}
-		toolCalls = append(toolCalls, tools.ToolCall{
-			ID:    tc.ID,
-			Name:  tc.Function.Name,
-			Input: input,
-		})
-	}
-
-	h.runnerLogger.Printf("[tool_execution] executing %d tools", len(toolCalls))
-
-	// Execute tools
-	var toolResultMsgs []map[string]interface{}
-	for _, call := range toolCalls {
-		h.runnerLogger.Printf("[tools] executing %s with id %s", call.Name, call.ID)
-		result := h.toolExecutor.ExecuteTool(call)
-		h.runnerLogger.Printf("[tool_execution] executed %s: success=%v", call.Name, !result.IsError)
-
-		toolResultMsgs = append(toolResultMsgs, map[string]interface{}{
-			"role":         "tool",
-			"content":      result.Content,
-			"tool_call_id": result.ToolUseID,
-		})
-	}
-
-	// Build follow-up OpenAI request by appending assistant + tool results
-	var originalReq map[string]interface{}
-	if err := json.Unmarshal(openaiRequestBytes, &originalReq); err != nil {
-		anthropicResp, in, out, _, err2 := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
+	// Parse the current request to accumulate messages
+	var currentReq map[string]interface{}
+	if err := json.Unmarshal(openaiRequestBytes, &currentReq); err != nil {
+		anthropicResp, in, out, tc, err2 := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
 		if err2 != nil {
-			return openaiRespBytes, response.Usage.PromptTokens, response.Usage.CompletionTokens, hasToolCall, err
+			return openaiRespBytes, 0, 0, false, err
 		}
-		return anthropicResp, in, out, hasToolCall, err
+		return anthropicResp, in, out, tc, nil
 	}
 
-	msgs, _ := originalReq["messages"].([]interface{})
+	currentRespBytes := openaiRespBytes
+	thinkingRetries := 0
 
-	// Add assistant message with tool_calls
-	assistantMsg := map[string]interface{}{
-		"role":       "assistant",
-		"tool_calls": response.Choices[0].Message.ToolCalls,
-	}
-	if response.Choices[0].Message.Content != nil {
-		assistantMsg["content"] = *response.Choices[0].Message.Content
-	}
-	msgs = append(msgs, assistantMsg)
+	for round := 0; round < maxToolRounds; round++ {
+		var response openAIChatResponse
+		if err := json.Unmarshal(currentRespBytes, &response); err != nil {
+			break
+		}
 
-	// Add tool result messages
-	for _, tr := range toolResultMsgs {
-		msgs = append(msgs, tr)
-	}
-	originalReq["messages"] = msgs
+		totalInputTokens += response.Usage.PromptTokens
+		totalOutputTokens += response.Usage.CompletionTokens
 
-	followupBytes, err := json.Marshal(originalReq)
+		// Check if response contains tool_calls
+		if len(response.Choices) == 0 || len(response.Choices[0].Message.ToolCalls) == 0 {
+			// Check for thinking loop: long text about tools but no actual tool call
+			content := ""
+			if len(response.Choices) > 0 && response.Choices[0].Message.Content != nil {
+				content = *response.Choices[0].Message.Content
+			}
+
+			if thinkingRetries < maxThinkingRetries && isThinkingLoop(content, thinkingThreshold) {
+				thinkingRetries++
+				h.runnerLogger.Printf("[tool_execution] detected thinking loop (retry %d/%d), nudging model=%s", thinkingRetries, maxThinkingRetries, model)
+
+				// Add the thinking text as assistant, then nudge as user
+				msgs, _ := currentReq["messages"].([]interface{})
+				// Truncate the thinking to save tokens
+				truncated := content
+				if len(truncated) > 200 {
+					truncated = truncated[:200] + "..."
+				}
+				msgs = append(msgs, map[string]interface{}{
+					"role":    "assistant",
+					"content": truncated,
+				})
+				msgs = append(msgs, map[string]interface{}{
+					"role":    "user",
+					"content": "Stop explaining and directly call the appropriate tool now. Use the tool_calls format.",
+				})
+				currentReq["messages"] = msgs
+
+				followupBytes, err := json.Marshal(currentReq)
+				if err != nil {
+					break
+				}
+
+				apiKey := h.resolveAPIKey(routing)
+				timeouts := config.GetModelTimeouts(routing.Model)
+
+				followupRespBytes, err := h.executeToolContinuationOpenAIWithRetry(routing.BaseURL, apiKey, path, followupBytes, timeouts, model)
+				if err != nil {
+					h.runnerLogger.Printf("[tool_execution] thinking nudge failed: %v", err)
+					break
+				}
+
+				followupRespBytes = anthropiccompat.ExtractToolCallsFromText(followupRespBytes)
+				currentRespBytes = followupRespBytes
+				continue
+			}
+
+			// No tool calls and not a thinking loop — done
+			anthropicResp, _, _, tc, err := anthropiccompat.OpenAIResponseToAnthropic(currentRespBytes, model)
+			if err != nil {
+				return currentRespBytes, totalInputTokens, totalOutputTokens, hasToolCall, err
+			}
+			return anthropicResp, totalInputTokens, totalOutputTokens, hasToolCall || tc, nil
+		}
+
+		hasToolCall = true
+		thinkingRetries = 0 // reset on successful tool call
+		h.runnerLogger.Printf("[tool_execution] round %d: %d tool calls from model=%s", round+1, len(response.Choices[0].Message.ToolCalls), model)
+
+		var toolCalls []tools.ToolCall
+		for _, tc := range response.Choices[0].Message.ToolCalls {
+			var input map[string]interface{}
+			if json.Unmarshal([]byte(tc.Function.Arguments), &input) != nil {
+				input = map[string]interface{}{}
+			}
+			toolCalls = append(toolCalls, tools.ToolCall{
+				ID:    tc.ID,
+				Name:  tc.Function.Name,
+				Input: input,
+			})
+		}
+
+		h.runnerLogger.Printf("[tool_execution] executing %d tools", len(toolCalls))
+
+		// Execute tools
+		var toolResultMsgs []map[string]interface{}
+		for _, call := range toolCalls {
+			h.runnerLogger.Printf("[tools] executing %s with id %s", call.Name, call.ID)
+			result := h.toolExecutor.ExecuteTool(call)
+			h.runnerLogger.Printf("[tool_execution] executed %s: success=%v", call.Name, !result.IsError)
+
+			toolResultMsgs = append(toolResultMsgs, map[string]interface{}{
+				"role":         "tool",
+				"content":      result.Content,
+				"tool_call_id": result.ToolUseID,
+			})
+		}
+
+		// Append assistant message with tool_calls + tool results to conversation
+		msgs, _ := currentReq["messages"].([]interface{})
+
+		assistantMsg := map[string]interface{}{
+			"role":       "assistant",
+			"tool_calls": response.Choices[0].Message.ToolCalls,
+		}
+		if response.Choices[0].Message.Content != nil {
+			assistantMsg["content"] = *response.Choices[0].Message.Content
+		}
+		msgs = append(msgs, assistantMsg)
+
+		for _, tr := range toolResultMsgs {
+			msgs = append(msgs, tr)
+		}
+		currentReq["messages"] = msgs
+
+		followupBytes, err := json.Marshal(currentReq)
+		if err != nil {
+			break
+		}
+
+		// Send follow-up request
+		apiKey := h.resolveAPIKey(routing)
+		timeouts := config.GetModelTimeouts(routing.Model)
+
+		followupRespBytes, err := h.executeToolContinuationOpenAIWithRetry(routing.BaseURL, apiKey, path, followupBytes, timeouts, routing.Model)
+		if err != nil {
+			h.runnerLogger.Printf("[tool_execution] follow-up request failed at round %d: %v", round+1, err)
+			break
+		}
+
+		// Try text extraction on follow-up too
+		followupRespBytes = anthropiccompat.ExtractToolCallsFromText(followupRespBytes)
+		currentRespBytes = followupRespBytes
+	}
+
+	h.runnerLogger.Printf("[tool_execution] completed with %d input + %d output tokens", totalInputTokens, totalOutputTokens)
+
+	// Convert final response to Anthropic format
+	anthropicResp, _, _, tc, err := anthropiccompat.OpenAIResponseToAnthropic(currentRespBytes, model)
 	if err != nil {
-		anthropicResp, in, out, _, _ := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
-		return anthropicResp, in, out, hasToolCall, err
+		return currentRespBytes, totalInputTokens, totalOutputTokens, hasToolCall, err
 	}
-
-	// Send follow-up request through OpenAI-compat endpoint
-	apiKey := h.resolveAPIKey(routing)
-	timeouts := config.GetModelTimeouts(routing.Model)
-
-	followupRespBytes, err := h.executeToolContinuationOpenAIWithRetry(routing.BaseURL, apiKey, path, followupBytes, timeouts, routing.Model)
-	if err != nil {
-		h.runnerLogger.Printf("[tool_execution] follow-up request failed: %v", err)
-		anthropicResp, in, out, _, _ := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
-		return anthropicResp, in, out, hasToolCall, err
-	}
-
-	// Convert follow-up OpenAI response to Anthropic format
-	anthropicResp, in2, out2, tc2, err := anthropiccompat.OpenAIResponseToAnthropic(followupRespBytes, model)
-	if err != nil {
-		return followupRespBytes, response.Usage.PromptTokens, response.Usage.CompletionTokens, hasToolCall, err
-	}
-
-	totalIn := response.Usage.PromptTokens + in2
-	totalOut := response.Usage.CompletionTokens + out2
-
-	h.runnerLogger.Printf("[tool_execution] completed with %d input + %d output tokens", totalIn, totalOut)
-
-	return anthropicResp, totalIn, totalOut, hasToolCall || tc2, nil
+	return anthropicResp, totalInputTokens, totalOutputTokens, hasToolCall || tc, nil
 }
 
 // executeToolContinuationOpenAIWithRetry sends a follow-up request to an OpenAI-compat endpoint with retry logic.
@@ -374,5 +433,26 @@ func (h *Handler) executeToolContinuationOpenAIWithRetry(baseURL, apiKey, path s
 	}
 
 	return nil, lastErr
+}
+
+// isThinkingLoop detects when a model is stuck reasoning about calling tools
+// without actually producing tool_calls. Common with smaller/weaker models.
+func isThinkingLoop(content string, threshold int) bool {
+	if len(content) < threshold {
+		return false
+	}
+	lower := strings.ToLower(content)
+	indicators := []string{
+		"i need to", "i should", "let me", "the correct approach",
+		"tool call", "tool_call", "todowrite", "function_call",
+		"the assistant should", "the user", "each todo",
+		"i'll call", "i will call", "let's call",
+		"the next step", "so the correct", "so i should",
+	}
+	hits := 0
+	for _, ind := range indicators {
+		hits += strings.Count(lower, ind)
+	}
+	return hits >= 3
 }
 
