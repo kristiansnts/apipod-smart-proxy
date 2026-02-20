@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/config"
@@ -436,8 +437,9 @@ func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http
 	// Check if this is a Claude Code request (client handles tools) vs proxy-injected tools
 	isClaudeCode := anthropiccompat.IsClaudeCodeRequest(bodyBytes)
 
-	// Convert Anthropic request to OpenAI format
-	openaiBody, isStream, err := anthropiccompat.AnthropicToOpenAI(bodyBytes)
+	// Convert Anthropic request to OpenAI format, preserving cache_control for OpenRouter
+	isOpenRouter := strings.Contains(routing.BaseURL, "openrouter.ai")
+	openaiBody, isStream, err := anthropiccompat.AnthropicToOpenAI(bodyBytes, isOpenRouter)
 	if err != nil {
 		h.logger.Printf("[%s/anthropic] conversion error: %v", routing.ProviderType, err)
 		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
@@ -634,7 +636,7 @@ func (h *Handler) handleGoogleAIStudio(w http.ResponseWriter, r *http.Request, r
 // handleGoogleAIStudioFromAnthropic handles Anthropic-format requests routed to Google AI Studio.
 func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte, startTime time.Time, username string) (int, int, bool) {
 	// Convert Anthropic request to OpenAI format first
-	openaiBody, _, err := anthropiccompat.AnthropicToOpenAI(bodyBytes)
+	openaiBody, _, err := anthropiccompat.AnthropicToOpenAI(bodyBytes, false)
 	if err != nil {
 		h.logger.Printf("[google_ai_studio/anthropic] anthropic→openai conversion error: %v", err)
 		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
