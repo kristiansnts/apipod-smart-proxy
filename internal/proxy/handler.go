@@ -222,11 +222,11 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		Username: fmt.Sprintf("org_%d", cfg.OrgID),
 	}
 
-	h.handleNativeUpstreamAnthropic(w, r, routing, user, req.Model, bodyBytes)
+	inTokens, outTokens := h.handleNativeUpstreamAnthropic(w, r, routing, user, req.Model, bodyBytes)
 
 	// Async usage commit (non-blocking)
 	if h.usageCommitter != nil {
-		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, 0, 0)
+		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, inTokens, outTokens)
 	}
 }
 
@@ -285,10 +285,10 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		Username: fmt.Sprintf("org_%d", cfg.OrgID),
 	}
 
-	h.handleNativeUpstream(w, r, routing, user, req.Model, bodyBytes)
+	inTokens, outTokens := h.handleNativeUpstream(w, r, routing, user, req.Model, bodyBytes)
 
 	// Async usage commit (non-blocking)
 	if h.usageCommitter != nil {
-		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, 0, 0)
+		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, inTokens, outTokens)
 	}
 }
