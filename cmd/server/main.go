@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -9,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rpay/apipod-smart-proxy/internal/config"
+	proxyConfig "github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
 	"github.com/rpay/apipod-smart-proxy/internal/pool"
@@ -29,16 +30,15 @@ func main() {
 
 	logger.Println("Starting Apipod Smart Proxy...")
 
-	cfg, err := config.Load()
+	cfg, err := proxyConfig.Load()
 	if err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 	logger.Printf("Configuration loaded successfully")
-	// logger.Printf("Upstream Antigravity: %s", cfg.AntigravityURL) // Removed, now local to Rust Engine
-	logger.Printf("Database: %s", cfg.DatabaseURL)
+	logger.Printf("Config Mode: %s", cfg.ConfigMode)
 	logger.Printf("Port: %s", cfg.Port)
 
-	// Initialize PostgreSQL
+	// Initialize PostgreSQL (still needed for routing/quota_items)
 	db, err := database.New(cfg.DatabaseURL)
 	if err != nil {
 		logger.Fatalf("Failed to initialize database: %v", err)
@@ -46,13 +46,41 @@ func main() {
 	defer db.Close()
 	logger.Println("Database initialized successfully")
 
+	// Initialize config loader based on mode
+	var configLoader proxyConfig.ConfigLoader
+	switch cfg.ConfigMode {
+	case "static":
+		if cfg.StaticConfigPath == "" {
+			logger.Fatalf("STATIC_CONFIG_PATH required for static config mode")
+		}
+		configLoader, err = proxyConfig.NewStaticConfigLoader(cfg.StaticConfigPath)
+		if err != nil {
+			logger.Fatalf("Failed to load static config: %v", err)
+		}
+		logger.Printf("Static config loaded from: %s", cfg.StaticConfigPath)
+	case "remote":
+		if cfg.BackendURL == "" || cfg.InternalAPISecret == "" {
+			logger.Fatalf("BACKEND_URL and INTERNAL_API_SECRET required for remote config mode")
+		}
+		configLoader = proxyConfig.NewRemoteConfigLoader(cfg.BackendURL, cfg.InternalAPISecret)
+		logger.Printf("Remote config loader: %s", cfg.BackendURL)
+	default:
+		logger.Fatalf("Invalid CONFIG_MODE: %s (expected 'remote' or 'static')", cfg.ConfigMode)
+	}
+
 	// Initialize components
-	authMiddleware := middleware.NewAuthMiddleware(db)
+	authMiddleware := middleware.NewAuthMiddleware(configLoader, runnerLogger)
 	loggingMiddleware := middleware.NewLoggingMiddleware(logger)
 	proxyRouter := proxy.NewRouter(db)
 	modelLimiter := pool.NewModelLimiter()
 
-	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger, modelLimiter)
+	// Initialize usage committer (only for remote mode)
+	var usageCommitter *proxy.UsageCommitter
+	if cfg.ConfigMode == "remote" {
+		usageCommitter = proxy.NewUsageCommitter(cfg.BackendURL, cfg.InternalAPISecret, runnerLogger)
+	}
+
+	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger, modelLimiter, usageCommitter)
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
@@ -81,6 +109,12 @@ func main() {
 		logger.Println("  POST /v1/chat/completions    - Chat completions (Bearer token required)")
 		logger.Println("  POST /v1/messages            - Anthropic Messages API (x-api-key or Bearer token)")
 		logger.Println("")
+		logger.Printf("Config Mode: %s", cfg.ConfigMode)
+		if cfg.ConfigMode == "static" {
+			logger.Println("  Running in SELF-HOST mode (static config)")
+		} else {
+			logger.Println(fmt.Sprintf("  Running in SAAS mode (backend: %s)", cfg.BackendURL))
+		}
 		logger.Println("Press Ctrl+C to stop...")
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
