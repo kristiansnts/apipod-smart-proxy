@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/config"
@@ -407,6 +408,9 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 	// Sanitize empty tool names before forwarding
 	bodyBytes = anthropiccompat.SanitizeEmptyToolNames(bodyBytes)
 
+	// Strip extended thinking params/blocks — GHCP does not support them
+	bodyBytes = anthropiccompat.StripThinking(bodyBytes)
+
 	resp, upstreamURL, err := copilot.ProxyToCopilot(routing.BaseURL, routing.APIKey, routing.Model, bodyBytes, req.Stream)
 	if err != nil {
 		h.runnerLogger.Printf("ERROR [cliproxy/anthropic] model=%s url=%s user=%s latency=%s err=%v", routing.Model, upstreamURL, username, time.Since(startTime).Round(time.Millisecond), err)
@@ -422,13 +426,45 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 		h.runnerLogger.Printf("ERROR [cliproxy/anthropic] status=%d model=%s url=%s user=%s latency=%s body=%s", resp.StatusCode, routing.Model, upstreamURL, username, time.Since(startTime).Round(time.Millisecond), string(respBody))
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
-	} else {
-		h.runnerLogger.Printf("OK [cliproxy/anthropic] model=%s stream=%v latency=%s user=%s req_size=%d",
-			routing.Model, req.Stream, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		return 0, 0, false
 	}
-	return 0, 0, false
+
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(resp.StatusCode)
+		in, out, cacheHit := antigravity.StreamTransform(resp.Body, w)
+		h.runnerLogger.Printf("OK [cliproxy/anthropic] model=%s stream=true tokens=%d/%d latency=%s user=%s req_size=%d",
+			routing.Model, in, out, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
+		h.modelLimiter.RecordTokens(routing.LLMModelID, in+out)
+		if usageCtx.QuotaItemID > 0 {
+			h.db.LogUsage(usageCtx, in, out)
+		}
+		return in, out, cacheHit
+	}
+
+	respBytes, _ := io.ReadAll(resp.Body)
+	cacheHit := extractAnthropicCacheHit(respBytes)
+
+	var usage struct {
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	json.Unmarshal(respBytes, &usage)
+	in, out := usage.Usage.InputTokens, usage.Usage.OutputTokens
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBytes)
+
+	h.runnerLogger.Printf("OK [cliproxy/anthropic] model=%s stream=false tokens=%d/%d latency=%s user=%s req_size=%d",
+		routing.Model, in, out, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
+	h.modelLimiter.RecordTokens(routing.LLMModelID, in+out)
+	if usageCtx.QuotaItemID > 0 {
+		h.db.LogUsage(usageCtx, in, out)
+	}
+	return in, out, cacheHit
 }
 
 // handleOpenAICompatFromAnthropic converts Anthropic→OpenAI, proxies, then converts response back to Anthropic.
@@ -436,8 +472,9 @@ func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http
 	// Check if this is a Claude Code request (client handles tools) vs proxy-injected tools
 	isClaudeCode := anthropiccompat.IsClaudeCodeRequest(bodyBytes)
 
-	// Convert Anthropic request to OpenAI format
-	openaiBody, isStream, err := anthropiccompat.AnthropicToOpenAI(bodyBytes)
+	// Convert Anthropic request to OpenAI format, preserving cache_control for OpenRouter
+	isOpenRouter := strings.Contains(routing.BaseURL, "openrouter.ai")
+	openaiBody, isStream, err := anthropiccompat.AnthropicToOpenAI(bodyBytes, isOpenRouter)
 	if err != nil {
 		h.logger.Printf("[%s/anthropic] conversion error: %v", routing.ProviderType, err)
 		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
@@ -458,6 +495,27 @@ func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http
 	var body map[string]interface{}
 	json.Unmarshal(openaiBody, &body)
 	body["model"] = routing.Model
+
+	// Re-cap max_tokens using the routed model name, since the original request used
+	// the client-facing model name (e.g. claude-sonnet-4-6) not the actual upstream model.
+	if mt, ok := body["max_tokens"].(float64); ok {
+		body["max_tokens"] = anthropiccompat.CapMaxTokens(routing.Model, int(mt))
+	}
+
+	// DeepSeek Reasoner requires reasoning_content on every assistant message in history.
+	// Inject empty string for any assistant message that lacks it.
+	if strings.Contains(routing.BaseURL, "deepseek.com") {
+		if msgs, ok := body["messages"].([]interface{}); ok {
+			for _, m := range msgs {
+				if msg, ok := m.(map[string]interface{}); ok && msg["role"] == "assistant" {
+					if _, has := msg["reasoning_content"]; !has {
+						msg["reasoning_content"] = ""
+					}
+				}
+			}
+		}
+	}
+
 	openaiBody, _ = json.Marshal(body)
 
 	path := "/v1/chat/completions"
@@ -600,21 +658,22 @@ func (h *Handler) handleGoogleAIStudio(w http.ResponseWriter, r *http.Request, r
 
 	var inputTokens, outputTokens int
 	hasToolCall := false
+	cacheHit := false
 
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		inputTokens, outputTokens, hasToolCall = googleaistudio.StreamTransformToOpenAI(resp.Body, w, routing.Model)
+		inputTokens, outputTokens, hasToolCall, cacheHit = googleaistudio.StreamTransformToOpenAI(resp.Body, w, routing.Model)
 	} else {
 		respBody, _ := io.ReadAll(resp.Body)
-		transformed, in, out, tc, err := googleaistudio.GeminiToOpenAI(respBody, routing.Model)
+		transformed, in, out, tc, ch, err := googleaistudio.GeminiToOpenAI(respBody, routing.Model)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(resp.StatusCode)
 			w.Write(respBody)
 			return 0, 0, false
 		}
-		inputTokens, outputTokens, hasToolCall = in, out, tc
+		inputTokens, outputTokens, hasToolCall, cacheHit = in, out, tc, ch
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(transformed)
@@ -628,13 +687,20 @@ func (h *Handler) handleGoogleAIStudio(w http.ResponseWriter, r *http.Request, r
 	if usageCtx.QuotaItemID > 0 {
 		h.db.LogUsage(usageCtx, inputTokens, outputTokens)
 	}
-	return inputTokens, outputTokens, false // Google AI Studio does not expose prompt cache info
+	return inputTokens, outputTokens, cacheHit
 }
 
 // handleGoogleAIStudioFromAnthropic handles Anthropic-format requests routed to Google AI Studio.
 func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte, startTime time.Time, username string) (int, int, bool) {
+	// Check if the client requested streaming
+	var origReq struct {
+		Stream bool `json:"stream"`
+	}
+	json.Unmarshal(bodyBytes, &origReq)
+	clientWantsStream := origReq.Stream
+
 	// Convert Anthropic request to OpenAI format first
-	openaiBody, _, err := anthropiccompat.AnthropicToOpenAI(bodyBytes)
+	openaiBody, _, err := anthropiccompat.AnthropicToOpenAI(bodyBytes, false)
 	if err != nil {
 		h.logger.Printf("[google_ai_studio/anthropic] anthropic→openai conversion error: %v", err)
 		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Invalid request body"}}`, http.StatusBadRequest)
@@ -679,7 +745,7 @@ func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *ht
 
 	// Gemini response → OpenAI format → Anthropic format
 	geminiRespBody, _ := io.ReadAll(resp.Body)
-	openaiResp, _, _, _, err := googleaistudio.GeminiToOpenAI(geminiRespBody, routing.Model)
+	openaiResp, _, _, _, _, err := googleaistudio.GeminiToOpenAI(geminiRespBody, routing.Model)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
@@ -695,12 +761,22 @@ func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *ht
 		return 0, 0, false
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(anthropicResp)
+	if clientWantsStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		anthropiccompat.WriteAnthropicResponseAsSSE(anthropicResp, w, routing.Model)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(anthropicResp)
+	}
 
-	h.runnerLogger.Printf("OK [google_ai_studio/anthropic] model=%s stream=false tool_call=%v tokens=%d/%d latency=%s user=%s req_size=%d",
-		routing.Model, hasToolCall,
+	h.runnerLogger.Printf("OK [google_ai_studio/anthropic] model=%s stream=%v tool_call=%v tokens=%d/%d latency=%s user=%s req_size=%d",
+		routing.Model, clientWantsStream, hasToolCall,
 		inputTokens, outputTokens, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
 
 	h.modelLimiter.RecordTokens(routing.LLMModelID, inputTokens+outputTokens)

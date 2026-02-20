@@ -30,6 +30,9 @@ type ChatCompletionResponse struct {
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details,omitempty"`
+		// DeepSeek KV cache fields (automatic, no setup required)
+		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
 	} `json:"usage"`
 }
 
@@ -55,6 +58,9 @@ type StreamChunk struct {
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details,omitempty"`
+		// DeepSeek KV cache fields (automatic, no setup required)
+		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
 	} `json:"usage,omitempty"`
 }
 
@@ -65,7 +71,8 @@ func ExtractTokens(body []byte) (int, int, bool, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return 0, 0, false, err
 	}
-	cacheHit := resp.Usage.PromptTokensDetails != nil && resp.Usage.PromptTokensDetails.CachedTokens > 0
+	cacheHit := (resp.Usage.PromptTokensDetails != nil && resp.Usage.PromptTokensDetails.CachedTokens > 0) ||
+		resp.Usage.PromptCacheHitTokens > 0
 	return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, cacheHit, nil
 }
 
@@ -117,7 +124,8 @@ func StreamTransform(r io.Reader, w io.Writer) (int, int, bool, bool) {
 				if chunk.Usage != nil {
 					inputTokens = chunk.Usage.PromptTokens
 					outputTokens = chunk.Usage.CompletionTokens
-					if chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0 {
+					if (chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0) ||
+						chunk.Usage.PromptCacheHitTokens > 0 {
 						cacheHit = true
 					}
 				}

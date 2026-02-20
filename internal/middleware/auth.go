@@ -72,6 +72,7 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 				statusCode = http.StatusTooManyRequests
 			}
 
+			m.logger.Printf("AUTH_REJECTED [%d] reason=%q key=%s", statusCode, reason, maskAPIKey(apiKey))
 			http.Error(w, `{"error": "`+reason+`"}`, statusCode)
 			return
 		}
@@ -88,4 +89,12 @@ func GetConfigFromContext(ctx context.Context) *config.RuntimeConfig {
 		return cfg
 	}
 	return nil
+}
+
+// maskAPIKey returns a redacted version of an API key for safe logging.
+func maskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:4] + "..." + key[len(key)-4:]
 }

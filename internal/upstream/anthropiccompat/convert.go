@@ -52,19 +52,21 @@ type AnthropicMsg struct {
 }
 
 type ContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl map[string]interface{} `json:"cache_control,omitempty"`
 }
 
 type FullContentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	Thinking  string          `json:"thinking,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text,omitempty"`
+	Thinking     string                 `json:"thinking,omitempty"`
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+	Input        json.RawMessage        `json:"input,omitempty"`
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`
+	Content      json.RawMessage        `json:"content,omitempty"`
+	CacheControl map[string]interface{} `json:"cache_control,omitempty"`
 }
 
 type OpenAIToolCall struct {
@@ -259,7 +261,9 @@ func DeduplicateToolResults(bodyBytes []byte) []byte {
 
 // AnthropicToOpenAI converts an Anthropic Messages request body to OpenAI chat completions format,
 // properly handling tool_use and tool_result content blocks.
-func AnthropicToOpenAI(body []byte) ([]byte, bool, error) {
+// When preserveCacheControl is true, cache_control breakpoints are preserved in content blocks
+// for providers that support OpenRouter-style prompt caching (e.g. openrouter.ai).
+func AnthropicToOpenAI(body []byte, preserveCacheControl bool) ([]byte, bool, error) {
 	var req AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, false, err
@@ -267,29 +271,40 @@ func AnthropicToOpenAI(body []byte) ([]byte, bool, error) {
 
 	var messages []OpenAIMessage
 
-	systemContent := ""
-	if req.System != nil {
-		systemContent = extractSystemText(req.System)
+	isClaudeCode := len(req.Tools) > 0
+
+	customPrefix := ""
+	if !isClaudeCode {
+		if msg, err := loadCustomSystemMessage(); err == nil {
+			customPrefix = msg
+		}
 	}
 
-	isClaudeCode := len(req.Tools) > 0
-	if !isClaudeCode {
-		customSystemMsg, err := loadCustomSystemMessage()
-		if err == nil && customSystemMsg != "" {
+	if req.System != nil || customPrefix != "" {
+		if preserveCacheControl {
+			if msg := buildOpenAISystemMessage(req.System, customPrefix); msg != nil {
+				messages = append(messages, *msg)
+			}
+		} else {
+			systemContent := ""
+			if req.System != nil {
+				systemContent = extractSystemText(req.System)
+			}
+			if customPrefix != "" {
+				if systemContent != "" {
+					systemContent = customPrefix + "\n\n" + systemContent
+				} else {
+					systemContent = customPrefix
+				}
+			}
 			if systemContent != "" {
-				systemContent = customSystemMsg + "\n\n" + systemContent
-			} else {
-				systemContent = customSystemMsg
+				messages = append(messages, OpenAIMessage{Role: "system", Content: systemContent})
 			}
 		}
 	}
 
-	if systemContent != "" {
-		messages = append(messages, OpenAIMessage{Role: "system", Content: systemContent})
-	}
-
 	for _, m := range req.Messages {
-		converted := convertAnthropicMessageToOpenAI(m)
+		converted := convertAnthropicMessageToOpenAI(m, preserveCacheControl)
 		messages = append(messages, converted...)
 	}
 
@@ -332,7 +347,7 @@ func AnthropicToOpenAI(body []byte) ([]byte, bool, error) {
 	return out, req.Stream, err
 }
 
-func convertAnthropicMessageToOpenAI(m AnthropicMsg) []OpenAIMessage {
+func convertAnthropicMessageToOpenAI(m AnthropicMsg, preserveCacheControl bool) []OpenAIMessage {
 	var s string
 	if json.Unmarshal(m.Content, &s) == nil {
 		return []OpenAIMessage{{Role: m.Role, Content: s}}
@@ -348,7 +363,7 @@ func convertAnthropicMessageToOpenAI(m AnthropicMsg) []OpenAIMessage {
 	}
 
 	if m.Role == "user" {
-		return convertUserBlocks(blocks)
+		return convertUserBlocks(blocks, preserveCacheControl)
 	}
 
 	text := extractTextFromBlocks(blocks)
@@ -405,18 +420,34 @@ func convertAssistantBlocks(blocks []FullContentBlock) []OpenAIMessage {
 	return []OpenAIMessage{msg}
 }
 
-func convertUserBlocks(blocks []FullContentBlock) []OpenAIMessage {
+func convertUserBlocks(blocks []FullContentBlock, preserveCacheControl bool) []OpenAIMessage {
 	var msgs []OpenAIMessage
 	var textParts []string
+	var contentParts []map[string]interface{}
 
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			textParts = append(textParts, b.Text)
+			if preserveCacheControl {
+				part := map[string]interface{}{"type": "text", "text": b.Text}
+				if b.CacheControl != nil {
+					part["cache_control"] = b.CacheControl
+				}
+				contentParts = append(contentParts, part)
+			} else {
+				textParts = append(textParts, b.Text)
+			}
 		case "tool_result":
-			if len(textParts) > 0 {
-				msgs = append(msgs, OpenAIMessage{Role: "user", Content: strings.Join(textParts, "\n")})
-				textParts = nil
+			if preserveCacheControl {
+				if len(contentParts) > 0 {
+					msgs = append(msgs, OpenAIMessage{Role: "user", Content: contentParts})
+					contentParts = nil
+				}
+			} else {
+				if len(textParts) > 0 {
+					msgs = append(msgs, OpenAIMessage{Role: "user", Content: strings.Join(textParts, "\n")})
+					textParts = nil
+				}
 			}
 			resultContent := extractToolResultContent(b.Content)
 			msgs = append(msgs, OpenAIMessage{
@@ -427,8 +458,14 @@ func convertUserBlocks(blocks []FullContentBlock) []OpenAIMessage {
 		}
 	}
 
-	if len(textParts) > 0 {
-		msgs = append(msgs, OpenAIMessage{Role: "user", Content: strings.Join(textParts, "\n")})
+	if preserveCacheControl {
+		if len(contentParts) > 0 {
+			msgs = append(msgs, OpenAIMessage{Role: "user", Content: contentParts})
+		}
+	} else {
+		if len(textParts) > 0 {
+			msgs = append(msgs, OpenAIMessage{Role: "user", Content: strings.Join(textParts, "\n")})
+		}
 	}
 
 	if len(msgs) == 0 {
@@ -570,6 +607,44 @@ func extractSystemText(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+// buildOpenAISystemMessage constructs an OpenAI system message from an Anthropic system field,
+// preserving cache_control breakpoints for providers that support prompt caching (e.g. openrouter.ai).
+// A plain-text prefix (e.g. custom system message) is prepended as an uncached text block.
+func buildOpenAISystemMessage(raw json.RawMessage, prefix string) *OpenAIMessage {
+	var parts []map[string]interface{}
+
+	if prefix != "" {
+		parts = append(parts, map[string]interface{}{"type": "text", "text": prefix})
+	}
+
+	if raw != nil {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			if s != "" {
+				parts = append(parts, map[string]interface{}{"type": "text", "text": s})
+			}
+		} else {
+			var blocks []ContentBlock
+			if json.Unmarshal(raw, &blocks) == nil {
+				for _, b := range blocks {
+					if b.Type == "text" {
+						part := map[string]interface{}{"type": "text", "text": b.Text}
+						if b.CacheControl != nil {
+							part["cache_control"] = b.CacheControl
+						}
+						parts = append(parts, part)
+					}
+				}
+			}
+		}
+	}
+
+	if len(parts) == 0 {
+		return nil
+	}
+	return &OpenAIMessage{Role: "system", Content: parts}
 }
 
 func extractContentText(raw json.RawMessage) string {
@@ -1135,6 +1210,54 @@ func loadCustomSystemMessage() (string, error) {
 
 func loadMCPTools() ([]interface{}, error) {
 	return orchestrator.LoadAllTools()
+}
+
+// CapMaxTokens caps the requested token count to the known limit for the given model.
+// This is exported so the proxy can re-apply limits after model routing.
+func CapMaxTokens(model string, requestedTokens int) int {
+	return getMaxTokensForModel(model, requestedTokens)
+}
+
+// StripThinking removes extended thinking fields from an Anthropic request body
+// for providers that don't support it (e.g. cliproxy/GHCP).
+// Strips: top-level "thinking" and "betas" params, and "thinking" content blocks from messages.
+func StripThinking(body []byte) []byte {
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	delete(req, "thinking")
+	delete(req, "betas")
+
+	// Strip thinking blocks from message content arrays
+	if msgs, ok := req["messages"].([]interface{}); ok {
+		for _, m := range msgs {
+			msg, ok := m.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			blocks, ok := msg["content"].([]interface{})
+			if !ok {
+				continue
+			}
+			filtered := blocks[:0]
+			for _, b := range blocks {
+				block, ok := b.(map[string]interface{})
+				if !ok || block["type"] == "thinking" {
+					continue
+				}
+				filtered = append(filtered, b)
+			}
+			msg["content"] = filtered
+		}
+	}
+
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func getMaxTokensForModel(model string, requestedTokens int) int {
