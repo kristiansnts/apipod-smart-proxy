@@ -19,14 +19,15 @@ func ExtractTokens(body []byte) (int, int) {
 }
 
 // StreamTransformToOpenAI converts a Gemini SSE stream to OpenAI SSE format.
-// Returns input tokens, output tokens, and whether a tool call was detected.
-func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, bool) {
+// Returns input tokens, output tokens, hasToolCall, and cacheHit.
+func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, bool, bool) {
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, len(buf))
 
 	inputTokens, outputTokens := 0, 0
 	hasToolCall := false
+	cacheHit := false
 	chunkIndex := 0
 
 	for scanner.Scan() {
@@ -54,6 +55,9 @@ func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, 
 		if gemResp.UsageMetadata != nil {
 			inputTokens = gemResp.UsageMetadata.PromptTokenCount
 			outputTokens = gemResp.UsageMetadata.CandidatesTokenCount
+			if gemResp.UsageMetadata.CachedContentTokenCount > 0 {
+				cacheHit = true
+			}
 		}
 
 		// Convert each candidate chunk to OpenAI stream chunk
@@ -61,6 +65,11 @@ func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, 
 			cand := gemResp.Candidates[0]
 
 			for _, part := range cand.Content.Parts {
+				// Skip internal thinking parts emitted by Gemini 2.5+
+				if part.Thought {
+					continue
+				}
+
 				chunk := map[string]interface{}{
 					"id":      fmt.Sprintf("chatcmpl-gemini-%d", chunkIndex),
 					"object":  "chat.completion.chunk",
@@ -95,16 +104,16 @@ func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, 
 							"finish_reason": nil,
 						},
 					}
-				} else {
+				} else if part.Text != "" {
 					chunk["choices"] = []map[string]interface{}{
 						{
-							"index": 0,
-							"delta": map[string]interface{}{
-								"content": part.Text,
-							},
+							"index":         0,
+							"delta":         map[string]interface{}{"content": part.Text},
 							"finish_reason": nil,
 						},
 					}
+				} else {
+					continue
 				}
 
 				chunkBytes, _ := json.Marshal(chunk)
@@ -169,5 +178,5 @@ func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, 
 		}
 	}
 
-	return inputTokens, outputTokens, hasToolCall
+	return inputTokens, outputTokens, hasToolCall, cacheHit
 }

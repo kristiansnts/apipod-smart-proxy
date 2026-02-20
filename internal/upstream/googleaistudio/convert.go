@@ -60,6 +60,7 @@ type geminiContent struct {
 
 type geminiPart struct {
 	Text             string                  `json:"text,omitempty"`
+	Thought          bool                    `json:"thought,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
 	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
@@ -104,9 +105,10 @@ type geminiCandidate struct {
 }
 
 type geminiUsage struct {
-	PromptTokenCount     int `json:"promptTokenCount"`
-	CandidatesTokenCount int `json:"candidatesTokenCount"`
-	TotalTokenCount      int `json:"totalTokenCount"`
+	PromptTokenCount      int `json:"promptTokenCount"`
+	CandidatesTokenCount  int `json:"candidatesTokenCount"`
+	TotalTokenCount       int `json:"totalTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount"`
 }
 
 // cleanSchema removes fields from a JSON Schema that Google AI Studio does not support,
@@ -120,12 +122,19 @@ func cleanSchema(raw json.RawMessage) json.RawMessage {
 		return raw
 	}
 
-	// Remove unsupported top-level fields
+	// Remove unsupported fields (Gemini Schema proto rejects these)
 	delete(m, "$schema")
+	delete(m, "$ref")
+	delete(m, "ref") // MCP/Claude Code tool schemas use bare "ref" without $
+	delete(m, "$defs")
+	delete(m, "definitions")
 	delete(m, "additionalProperties")
 	delete(m, "exclusiveMinimum")
 	delete(m, "exclusiveMaximum")
 	delete(m, "propertyNames")
+	delete(m, "contentMediaType")
+	delete(m, "contentEncoding")
+	delete(m, "unevaluatedProperties")
 
 	// Recurse into "properties" values
 	if props, ok := m["properties"]; ok {
@@ -140,9 +149,34 @@ func cleanSchema(raw json.RawMessage) json.RawMessage {
 		}
 	}
 
-	// Recurse into "items"
+	// Recurse into "items" — can be a single schema object OR an array of schemas
 	if items, ok := m["items"]; ok {
-		m["items"] = cleanSchema(items)
+		var itemsArr []json.RawMessage
+		if json.Unmarshal(items, &itemsArr) == nil {
+			for i, s := range itemsArr {
+				itemsArr[i] = cleanSchema(s)
+			}
+			if b, err := json.Marshal(itemsArr); err == nil {
+				m["items"] = b
+			}
+		} else {
+			m["items"] = cleanSchema(items)
+		}
+	}
+
+	// Recurse into allOf/anyOf/oneOf arrays
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := m[key]; ok {
+			var schemas []json.RawMessage
+			if json.Unmarshal(arr, &schemas) == nil {
+				for i, s := range schemas {
+					schemas[i] = cleanSchema(s)
+				}
+				if b, err := json.Marshal(schemas); err == nil {
+					m[key] = b
+				}
+			}
+		}
 	}
 
 	out, err := json.Marshal(m)
@@ -378,16 +412,18 @@ func hasThoughtSignatureForToolCall(messages []openAIMessage, toolCallID string)
 }
 
 // GeminiToOpenAI converts a Gemini response to OpenAI chat completion format.
-func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
+func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, bool, error) {
 	var resp geminiResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, 0, 0, false, err
+		return nil, 0, 0, false, false, err
 	}
 
 	inputTokens, outputTokens := 0, 0
+	cacheHit := false
 	if resp.UsageMetadata != nil {
 		inputTokens = resp.UsageMetadata.PromptTokenCount
 		outputTokens = resp.UsageMetadata.CandidatesTokenCount
+		cacheHit = resp.UsageMetadata.CachedContentTokenCount > 0
 	}
 
 	hasToolCall := false
@@ -421,7 +457,7 @@ func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
 					}
 				}
 				toolCalls = append(toolCalls, toolCall)
-			} else if part.Text != "" {
+			} else if part.Text != "" && !part.Thought {
 				content += part.Text
 			}
 		}
@@ -434,6 +470,7 @@ func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
 		}
 		if hasToolCall {
 			finishReason = "tool_calls"
+			content = "" // Gemini sometimes emits narration text alongside function calls — drop it
 		}
 	}
 
@@ -466,5 +503,5 @@ func GeminiToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
 	}
 
 	out, err := json.Marshal(openaiResp)
-	return out, inputTokens, outputTokens, hasToolCall, err
+	return out, inputTokens, outputTokens, hasToolCall, cacheHit, err
 }

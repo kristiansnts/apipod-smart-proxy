@@ -658,21 +658,22 @@ func (h *Handler) handleGoogleAIStudio(w http.ResponseWriter, r *http.Request, r
 
 	var inputTokens, outputTokens int
 	hasToolCall := false
+	cacheHit := false
 
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		inputTokens, outputTokens, hasToolCall = googleaistudio.StreamTransformToOpenAI(resp.Body, w, routing.Model)
+		inputTokens, outputTokens, hasToolCall, cacheHit = googleaistudio.StreamTransformToOpenAI(resp.Body, w, routing.Model)
 	} else {
 		respBody, _ := io.ReadAll(resp.Body)
-		transformed, in, out, tc, err := googleaistudio.GeminiToOpenAI(respBody, routing.Model)
+		transformed, in, out, tc, ch, err := googleaistudio.GeminiToOpenAI(respBody, routing.Model)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(resp.StatusCode)
 			w.Write(respBody)
 			return 0, 0, false
 		}
-		inputTokens, outputTokens, hasToolCall = in, out, tc
+		inputTokens, outputTokens, hasToolCall, cacheHit = in, out, tc, ch
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(transformed)
@@ -686,11 +687,18 @@ func (h *Handler) handleGoogleAIStudio(w http.ResponseWriter, r *http.Request, r
 	if usageCtx.QuotaItemID > 0 {
 		h.db.LogUsage(usageCtx, inputTokens, outputTokens)
 	}
-	return inputTokens, outputTokens, false // Google AI Studio does not expose prompt cache info
+	return inputTokens, outputTokens, cacheHit
 }
 
 // handleGoogleAIStudioFromAnthropic handles Anthropic-format requests routed to Google AI Studio.
 func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *http.Request, routing RoutingResult, usageCtx database.UsageContext, bodyBytes []byte, startTime time.Time, username string) (int, int, bool) {
+	// Check if the client requested streaming
+	var origReq struct {
+		Stream bool `json:"stream"`
+	}
+	json.Unmarshal(bodyBytes, &origReq)
+	clientWantsStream := origReq.Stream
+
 	// Convert Anthropic request to OpenAI format first
 	openaiBody, _, err := anthropiccompat.AnthropicToOpenAI(bodyBytes, false)
 	if err != nil {
@@ -737,7 +745,7 @@ func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *ht
 
 	// Gemini response → OpenAI format → Anthropic format
 	geminiRespBody, _ := io.ReadAll(resp.Body)
-	openaiResp, _, _, _, err := googleaistudio.GeminiToOpenAI(geminiRespBody, routing.Model)
+	openaiResp, _, _, _, _, err := googleaistudio.GeminiToOpenAI(geminiRespBody, routing.Model)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
@@ -753,12 +761,22 @@ func (h *Handler) handleGoogleAIStudioFromAnthropic(w http.ResponseWriter, r *ht
 		return 0, 0, false
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(anthropicResp)
+	if clientWantsStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		anthropiccompat.WriteAnthropicResponseAsSSE(anthropicResp, w, routing.Model)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(anthropicResp)
+	}
 
-	h.runnerLogger.Printf("OK [google_ai_studio/anthropic] model=%s stream=false tool_call=%v tokens=%d/%d latency=%s user=%s req_size=%d",
-		routing.Model, hasToolCall,
+	h.runnerLogger.Printf("OK [google_ai_studio/anthropic] model=%s stream=%v tool_call=%v tokens=%d/%d latency=%s user=%s req_size=%d",
+		routing.Model, clientWantsStream, hasToolCall,
 		inputTokens, outputTokens, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
 
 	h.modelLimiter.RecordTokens(routing.LLMModelID, inputTokens+outputTokens)
