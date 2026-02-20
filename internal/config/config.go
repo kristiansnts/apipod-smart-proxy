@@ -10,7 +10,6 @@ import (
 type Config struct {
 	Port        string
 	DatabaseURL string
-	AdminSecret string
 }
 
 func Load() (*Config, error) {
@@ -26,14 +25,8 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("DATABASE_URL not set")
 	}
 
-	adminSecret := os.Getenv("ADMIN_SECRET")
-	if adminSecret == "" {
-		return nil, fmt.Errorf("ADMIN_SECRET not set")
-	}
-
 	return &Config{
 		Port:        port,
 		DatabaseURL: databaseURL,
-		AdminSecret: adminSecret,
 	}, nil
 }

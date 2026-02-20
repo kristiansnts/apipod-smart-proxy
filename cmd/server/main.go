@@ -9,7 +9,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rpay/apipod-smart-proxy/internal/admin"
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
@@ -50,7 +49,6 @@ func main() {
 	// Initialize components
 	authMiddleware := middleware.NewAuthMiddleware(db)
 	loggingMiddleware := middleware.NewLoggingMiddleware(logger)
-	adminHandler := admin.NewHandler(db, cfg.AdminSecret)
 	proxyRouter := proxy.NewRouter(db)
 	modelLimiter := pool.NewModelLimiter()
 
@@ -59,7 +57,6 @@ func main() {
 	// Setup HTTP routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", proxy.HealthCheck)
-	mux.HandleFunc("/admin/create-key", adminHandler.CreateAPIKey)
 	mux.Handle("/v1/chat/completions",
 		loggingMiddleware.LogRequest(
 			authMiddleware.Authenticate(
@@ -81,11 +78,9 @@ func main() {
 		logger.Printf("Server listening on http://0.0.0.0:%s", cfg.Port)
 		logger.Println("Routes:")
 		logger.Println("  GET  /health                 - Health check")
-		logger.Println("  POST /admin/create-key       - Create API token (x-admin-secret required)")
 		logger.Println("  POST /v1/chat/completions    - Chat completions (Bearer token required)")
 		logger.Println("  POST /v1/messages            - Anthropic Messages API (x-api-key or Bearer token)")
 		logger.Println("")
-		logger.Println("Subscription plans: cursor-pro-auto | cursor-pro-sonnet | cursor-pro-opus")
 		logger.Println("Press Ctrl+C to stop...")
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

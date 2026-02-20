@@ -1,34 +1,34 @@
 # 🐬 Apipod Smart Proxy
 
-A production-ready smart API proxy in Go that orchestrates multiple AI providers including Antigravity, Google AI Studio, OpenAI, and GitHub Copilot, featuring intelligent model routing, authentication, and streaming support.
+A lightweight API proxy in Go that routes AI requests to multiple upstream providers. It handles authentication, weighted model routing, rate limiting, and streaming — all configured via a shared PostgreSQL database.
 
 ## ✨ Features
 
-- **🎯 Multi-Provider Orchestration**: Supports Antigravity, Google AI Studio, OpenAI-compatible, and GitHub Copilot endpoints
-- **🧠 Smart Model Routing**: Intelligent routing logic based on model availability and provider capabilities
-- **📊 Model Limiting**: Pool-based rate limiting with configurable concurrency controls
-- **🔐 API Key Authentication**: PostgreSQL-based user management with expiration support
-- **💰 Quota Management**: Subscription-based quota tracking and usage monitoring
-- **📡 Full Streaming Support**: Server-Sent Events (SSE) with configurable flush intervals
-- **👑 Admin Dashboard**: Comprehensive API key generation and user management
+- **🎯 Multi-Provider Routing**: Routes requests to Antigravity, Google AI Studio, OpenAI, NVIDIA NIM, and OpenRouter
+- **🧠 Weighted Model Selection**: Database-driven weighted random routing across providers and models
+- **📊 Rate Limiting**: Per-model RPM/TPM/RPD limits with pool-based concurrency controls
+- **🔐 Token Authentication**: Validates API tokens against a shared PostgreSQL database
+- **📡 Full Streaming Support**: Server-Sent Events (SSE) passthrough for real-time responses
+- **🔧 Tool Execution**: Built-in tool execution system for agentic workflows
 - **🚀 Production Ready**: Graceful shutdown, structured logging, health checks, Docker support
 
 ## 🏗️ Architecture
 
 ```
-Client Request
+Client Request (OpenAI / Anthropic format)
      ↓
-API Key Authentication & Authorization
+API Token Authentication (shared DB)
      ↓
-Orchestrator (Model Routing & Provider Selection)
+Smart Router (weighted model selection per subscription)
      ↓
-Pool Manager (Concurrency & Rate Limiting)
+Rate Limiter (RPM / TPM / RPD per model)
      ↓
-Upstream Provider Proxy
-     ├─ Antigravity Proxy
+Upstream Provider
+     ├─ Antigravity
      ├─ Google AI Studio
-     ├─ OpenAI-Compatible
-     └─ GitHub Copilot
+     ├─ OpenAI
+     ├─ NVIDIA NIM
+     └─ OpenRouter
 ```
 
 ## 📦 Installation
@@ -36,7 +36,7 @@ Upstream Provider Proxy
 ### Prerequisites
 
 - Go 1.21 or higher
-- SQLite (pure Go implementation, no CGO required)
+- PostgreSQL
 
 ### Quick Start
 
@@ -76,32 +76,11 @@ Create a `.env` file with the following variables:
 # Server Configuration
 PORT=8081
 
-# Database Configuration
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_USER=apipod
-POSTGRES_PASSWORD=your-secure-password
-POSTGRES_DB=apipod_proxy
-POSTGRES_SSLMODE=disable
+# PostgreSQL Database URL
+DATABASE_URL=postgresql://apipod:your-secure-password@localhost:5432/apipod_proxy?sslmode=disable
+```
 
-# Admin secret for creating API keys (min 16 chars)
-ADMIN_SECRET=your-secure-admin-secret
-
-# Upstream Provider Configuration
-ANTIGRAVITY_URL=http://127.0.0.1:8080
-ANTIGRAVITY_KEY=your-antigravity-api-key
-GOOGLE_AI_STUDIO_KEY=your-google-ai-studio-key
-OPENAI_API_KEY=your-openai-api-key
-COPILOT_CLIENT_ID=your-copilot-client-id
-COPILOT_CLIENT_SECRET=your-copilot-client-secret
-
-# Model Pool Configuration
-MAX_CONCURRENT_REQUESTS=100
-MODEL_CONCURRENCY_LIMIT=10
-
-# Logging Configuration
-LOG_LEVEL=info
-LOG_FORMAT=json
+> Supported providers: **Antigravity**, **Google AI Studio**, **OpenAI**, **NVIDIA NIM**, **OpenRouter**
 
 ## 📚 API Endpoints
 
@@ -123,57 +102,6 @@ curl http://localhost:8081/health
   "service": "apipod-smart-proxy"
 }
 ```
-
----
-
-### Create API Key (Admin)
-```bash
-POST /admin/create-key
-```
-Protected by `x-admin-secret` header.
-
-**Headers:**
-- `x-admin-secret`: Your admin secret from `.env`
-- `Content-Type`: application/json
-
-**Request Body:**
-```json
-{
-  "name": "user-name",
-  "tier": "elite",
-  "expires_in": 30
-}
-```
-
-**Parameters:**
-- `name` (required): User name
-- `tier` (optional): User tier (default: "elite")
-- `expires_in` (optional): Days until expiration
-
-**Example:**
-```bash
-curl -X POST http://localhost:8081/admin/create-key \
-  -H "x-admin-secret: your-admin-secret" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "test-user",
-    "tier": "elite",
-    "expires_in": 30
-  }'
-```
-
-**Response:**
-```json
-{
-  "api_key": "apk_abc123...",
-  "name": "test-user",
-  "tier": "elite",
-  "created_at": "2024-01-01T00:00:00Z",
-  "expires_at": "2024-01-31T00:00:00Z"
-}
-```
-
-⚠️ **Important**: The API key is only shown once! Save it securely.
 
 ---
 
@@ -262,29 +190,16 @@ curl -X POST http://localhost:8081/v1/messages \
 
 ---
 
-### Auth Copilot Tool
-```bash
-./auth-copilot
-```
-Standalone tool for GitHub Copilot authentication.
-
-**Usage:**
-```bash
-cd cmd/auth-copilot
-go run main.go
-```
-
-This tool helps generate GitHub Copilot access tokens for use with the proxy.
-
 ## 🎲 Smart Routing Logic
 
-The proxy uses intelligent routing based on:
-- Model availability across providers
-- Provider account configuration and health
-- Concurrency limits and rate limiting
-- Subscription tier entitlements
+The proxy selects an upstream provider using **weighted random selection** based on the user's subscription plan:
 
-Requests are automatically routed to the most appropriate upstream provider based on configured rules and real-time availability.
+1. User's subscription (`sub_id`) maps to quota items in the database
+2. Each quota item links a model + provider with a percentage weight
+3. A weighted random roll picks which model/provider handles the request
+4. Rate limits (RPM/TPM/RPD) are enforced per model before forwarding
+
+All provider API keys and base URLs are stored in the `providers` table — no hardcoded credentials.
 
 ## 🐳 Docker Deployment
 
@@ -298,16 +213,7 @@ docker build -t apipod-smart-proxy .
 docker run -d \
   --name apipod-proxy \
   -p 8081:8081 \
-  -e POSTGRES_HOST=your-postgres-host \
-  -e POSTGRES_PORT=5432 \
-  -e POSTGRES_USER=apipod \
-  -e POSTGRES_PASSWORD=your-secure-password \
-  -e POSTGRES_DB=apipod_proxy \
-  -e ADMIN_SECRET=your-admin-secret \
-  -e ANTIGRAVITY_URL=http://host.docker.internal:8080 \
-  -e ANTIGRAVITY_KEY=your-antigravity-key \
-  -e GOOGLE_AI_STUDIO_KEY=your-google-key \
-  -e OPENAI_API_KEY=your-openai-key \
+  -e DATABASE_URL=postgresql://apipod:your-secure-password@your-postgres-host:5432/apipod_proxy?sslmode=disable \
   apipod-smart-proxy
 ```
 
@@ -329,16 +235,14 @@ docker-compose down
 ```
 apipod-smart-proxy/
 ├── cmd/
-│   ├── server/main.go                 # Main proxy server entry point
-│   └── auth-copilot/main.go           # GitHub Copilot auth endpoint
+│   └── server/main.go                 # Main proxy server entry point
 ├── internal/
 │   ├── config/config.go               # Environment configuration
 │   ├── database/
 │   │   ├── database.go                # PostgreSQL connection
-│   │   ├── user.go                    # User model & queries
-│   │   ├── provider_account.go        # Provider account management
-│   │   ├── subscription.go            # Subscription management
-│   │   ├── quota_item.go              # Quota tracking
+│   │   ├── user.go                    # User auth queries
+│   │   ├── provider_account.go        # Provider account pool
+│   │   ├── quota_item.go              # Quota/routing queries
 │   │   └── usage_log.go               # Usage logging
 │   ├── middleware/
 │   │   ├── auth.go                    # API key authentication
@@ -354,23 +258,12 @@ apipod-smart-proxy/
 │   │   ├── router.go                  # Smart routing logic
 │   │   ├── handler.go                 # Reverse proxy + streaming
 │   │   └── native_handler.go          # Native request handling
-│   └── admin/handler.go               # Admin endpoint
-├── internal/upstream/
-│   ├── antigravity/
-│   │   ├── client.go                  # Antigravity client
-│   │   └── response.go                # Response handling
-│   ├── googleaistudio/
-│   │   ├── client.go                  # Google AI Studio client
-│   │   ├── convert.go                 # Request/response conversion
-│   │   └── response.go                # Response handling
-│   ├── openaicompat/
-│   │   ├── client.go                  # OpenAI-compatible client
-│   │   └── response.go                # Response handling
-│   ├── copilot/
-│   │   ├── client.go                  # GitHub Copilot client
-│   │   └── transform.go               # Request transformation
-│   └── anthropiccompat/convert.go     # Anthropic compatibility
-├── pkg/keygen/keygen.go               # API key generation
+│   ├── tools/                         # Tool execution system
+│   └── upstream/
+│       ├── antigravity/               # Antigravity proxy client
+│       ├── googleaistudio/            # Google AI Studio client
+│       ├── openaicompat/              # OpenAI / NVIDIA NIM / OpenRouter client
+│       └── anthropiccompat/           # Anthropic format conversion
 ├── go.mod                             # Go dependencies
 ├── .env.example                       # Config template
 ├── Dockerfile                         # Container image
@@ -380,11 +273,10 @@ apipod-smart-proxy/
 
 ## 🔒 Security Notes
 
-1. **Admin Secret**: Must be at least 16 characters. Use a strong, random secret in production.
-2. **API Keys**: Stored encrypted at rest in PostgreSQL. Ensure proper database security.
-3. **HTTPS**: Use a reverse proxy (nginx/caddy) for HTTPS in production.
-4. **Rate Limiting**: Implemented through pool-based concurrency controls.
-5. **Database Security**: Use PostgreSQL with SSL and proper access controls.
+1. **API Keys**: Validated against the shared PostgreSQL database. Ensure proper database security.
+2. **HTTPS**: Use a reverse proxy (nginx/caddy) for HTTPS in production.
+3. **Rate Limiting**: Implemented through pool-based concurrency controls.
+4. **Database Security**: Use PostgreSQL with SSL and proper access controls.
 
 ## 🐛 Troubleshooting
 
@@ -405,59 +297,14 @@ apipod-smart-proxy/
 
 ### 403 Forbidden
 - API key may be inactive, expired, or lacks permissions
-- For admin endpoint, verify `x-admin-secret` matches your `.env`
 
 ## 📊 Monitoring
 
-### Health Check
-
 ```bash
-# Check if service is running
+# Health check
 curl http://localhost:8081/health
 ```
 
-### Database Inspection
-
-```bash
-# Connect to PostgreSQL database
-psql postgresql://apipod:password@localhost/apipod_proxy
-
-# List all API keys
-SELECT api_key, name, tier, active, created_at, expires_at FROM users;
-
-# Check active users
-SELECT COUNT(*) FROM users WHERE active = true;
-```
-
-## 🚀 Production Deployment
-
-### Recommended Setup
-
-1. **Reverse Proxy**: Use nginx or caddy for HTTPS termination
-2. **Database Backups**: Implement PostgreSQL backup strategy
-3. **Secrets Management**: Use environment variables or secret management system
-4. **Monitoring**: Set up health check monitoring and metrics
-5. **Logging**: Configure structured logging with rotation
-6. **Scaling**: Use connection pooling and load balancing for high traffic
-
-### Example Nginx Configuration
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name api.yourdomain.com;
-
-    ssl_certificate /path/to/cert.pem;
-    ssl_certificate_key /path/to/key.pem;
-
-    location / {
-        proxy_pass http://localhost:8081;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_buffering off;  # Important for streaming!
-    }
-}
-```
 
 ## 📝 License
 
@@ -473,4 +320,4 @@ For issues and questions, please open a GitHub issue.
 
 ---
 
-**Built with ❤️ using Go and modernc.org/sqlite**
+**Built with ❤️ using Go**
