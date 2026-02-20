@@ -1218,6 +1218,48 @@ func CapMaxTokens(model string, requestedTokens int) int {
 	return getMaxTokensForModel(model, requestedTokens)
 }
 
+// StripThinking removes extended thinking fields from an Anthropic request body
+// for providers that don't support it (e.g. cliproxy/GHCP).
+// Strips: top-level "thinking" and "betas" params, and "thinking" content blocks from messages.
+func StripThinking(body []byte) []byte {
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	delete(req, "thinking")
+	delete(req, "betas")
+
+	// Strip thinking blocks from message content arrays
+	if msgs, ok := req["messages"].([]interface{}); ok {
+		for _, m := range msgs {
+			msg, ok := m.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			blocks, ok := msg["content"].([]interface{})
+			if !ok {
+				continue
+			}
+			filtered := blocks[:0]
+			for _, b := range blocks {
+				block, ok := b.(map[string]interface{})
+				if !ok || block["type"] == "thinking" {
+					continue
+				}
+				filtered = append(filtered, b)
+			}
+			msg["content"] = filtered
+		}
+	}
+
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 func getMaxTokensForModel(model string, requestedTokens int) int {
 	modelLimits := map[string]int{
 		"gpt-3.5-turbo":     4096,

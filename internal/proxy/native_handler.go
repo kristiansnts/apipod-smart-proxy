@@ -408,6 +408,9 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 	// Sanitize empty tool names before forwarding
 	bodyBytes = anthropiccompat.SanitizeEmptyToolNames(bodyBytes)
 
+	// Strip extended thinking params/blocks — GHCP does not support them
+	bodyBytes = anthropiccompat.StripThinking(bodyBytes)
+
 	resp, upstreamURL, err := copilot.ProxyToCopilot(routing.BaseURL, routing.APIKey, routing.Model, bodyBytes, req.Stream)
 	if err != nil {
 		h.runnerLogger.Printf("ERROR [cliproxy/anthropic] model=%s url=%s user=%s latency=%s err=%v", routing.Model, upstreamURL, username, time.Since(startTime).Round(time.Millisecond), err)
@@ -423,13 +426,45 @@ func (h *Handler) handleCopilotFromAnthropic(w http.ResponseWriter, r *http.Requ
 		h.runnerLogger.Printf("ERROR [cliproxy/anthropic] status=%d model=%s url=%s user=%s latency=%s body=%s", resp.StatusCode, routing.Model, upstreamURL, username, time.Since(startTime).Round(time.Millisecond), string(respBody))
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
-	} else {
-		h.runnerLogger.Printf("OK [cliproxy/anthropic] model=%s stream=%v latency=%s user=%s req_size=%d",
-			routing.Model, req.Stream, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		return 0, 0, false
 	}
-	return 0, 0, false
+
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(resp.StatusCode)
+		in, out, cacheHit := antigravity.StreamTransform(resp.Body, w)
+		h.runnerLogger.Printf("OK [cliproxy/anthropic] model=%s stream=true tokens=%d/%d latency=%s user=%s req_size=%d",
+			routing.Model, in, out, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
+		h.modelLimiter.RecordTokens(routing.LLMModelID, in+out)
+		if usageCtx.QuotaItemID > 0 {
+			h.db.LogUsage(usageCtx, in, out)
+		}
+		return in, out, cacheHit
+	}
+
+	respBytes, _ := io.ReadAll(resp.Body)
+	cacheHit := extractAnthropicCacheHit(respBytes)
+
+	var usage struct {
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	json.Unmarshal(respBytes, &usage)
+	in, out := usage.Usage.InputTokens, usage.Usage.OutputTokens
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBytes)
+
+	h.runnerLogger.Printf("OK [cliproxy/anthropic] model=%s stream=false tokens=%d/%d latency=%s user=%s req_size=%d",
+		routing.Model, in, out, time.Since(startTime).Round(time.Millisecond), username, len(bodyBytes))
+	h.modelLimiter.RecordTokens(routing.LLMModelID, in+out)
+	if usageCtx.QuotaItemID > 0 {
+		h.db.LogUsage(usageCtx, in, out)
+	}
+	return in, out, cacheHit
 }
 
 // handleOpenAICompatFromAnthropic converts Anthropic→OpenAI, proxies, then converts response back to Anthropic.
