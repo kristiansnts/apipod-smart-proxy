@@ -12,6 +12,7 @@ import (
 
 	proxyConfig "github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
+	"github.com/rpay/apipod-smart-proxy/internal/metrics"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
 	"github.com/rpay/apipod-smart-proxy/internal/pool"
 	"github.com/rpay/apipod-smart-proxy/internal/proxy"
@@ -80,11 +81,13 @@ func main() {
 		usageCommitter = proxy.NewUsageCommitter(cfg.BackendURL, cfg.InternalAPISecret, runnerLogger)
 	}
 
-	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger, modelLimiter, usageCommitter)
+	perfMetrics := metrics.New()
+	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger, modelLimiter, usageCommitter, perfMetrics)
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", proxy.HealthCheck)
+	mux.HandleFunc("/metrics", perfMetrics.Handler())
 	mux.Handle("/v1/chat/completions",
 		loggingMiddleware.LogRequest(
 			authMiddleware.Authenticate(
@@ -106,6 +109,7 @@ func main() {
 		logger.Printf("Server listening on http://0.0.0.0:%s", cfg.Port)
 		logger.Println("Routes:")
 		logger.Println("  GET  /health                 - Health check")
+		logger.Println("  GET  /metrics                - Performance snapshot")
 		logger.Println("  POST /v1/chat/completions    - Chat completions (Bearer token required)")
 		logger.Println("  POST /v1/messages            - Anthropic Messages API (x-api-key or Bearer token)")
 		logger.Println("")

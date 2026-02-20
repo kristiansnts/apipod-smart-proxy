@@ -8,9 +8,11 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
+	"github.com/rpay/apipod-smart-proxy/internal/metrics"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
 	"github.com/rpay/apipod-smart-proxy/internal/orchestrator"
 	"github.com/rpay/apipod-smart-proxy/internal/pool"
@@ -29,9 +31,28 @@ type Handler struct {
 	toolExecutor   *tools.Executor
 	rateLimiter    *RateLimiter
 	usageCommitter *UsageCommitter
+	metrics        *metrics.Metrics
 }
 
-func NewHandler(router *Router, db *database.DB, logger *log.Logger, runnerLogger *log.Logger, modelLimiter *pool.ModelLimiter, usageCommitter *UsageCommitter) *Handler {
+// statusRecorder wraps http.ResponseWriter to capture the response status code.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func NewHandler(router *Router, db *database.DB, logger *log.Logger, runnerLogger *log.Logger, modelLimiter *pool.ModelLimiter, usageCommitter *UsageCommitter, m *metrics.Metrics) *Handler {
 	return &Handler{
 		db:             db,
 		logger:         logger,
@@ -43,6 +64,7 @@ func NewHandler(router *Router, db *database.DB, logger *log.Logger, runnerLogge
 		toolExecutor:   tools.NewExecutor(runnerLogger),
 		rateLimiter:    NewRateLimiter(),
 		usageCommitter: usageCommitter,
+		metrics:        m,
 	}
 }
 
@@ -168,6 +190,16 @@ func (h *Handler) routeBYOK(w http.ResponseWriter, cfg *config.RuntimeConfig) (R
 
 // HandleMessages handles Anthropic Messages API requests (POST /v1/messages).
 func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	cacheHit := false
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.Record(time.Since(start).Milliseconds(), rec.status < 400, cacheHit)
+		}
+	}()
+	w = rec
+
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil || len(bodyBytes) == 0 {
 		http.Error(w, `{"error": {"type": "invalid_request_error", "message": "Failed to read request body"}}`, http.StatusBadRequest)
@@ -222,15 +254,25 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		Username: fmt.Sprintf("org_%d", cfg.OrgID),
 	}
 
-	inTokens, outTokens := h.handleNativeUpstreamAnthropic(w, r, routing, user, req.Model, bodyBytes)
+	inTokens, outTokens, cacheHit := h.handleNativeUpstreamAnthropic(w, r, routing, user, req.Model, bodyBytes)
 
 	// Async usage commit (non-blocking)
 	if h.usageCommitter != nil {
-		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, inTokens, outTokens)
+		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, inTokens, outTokens, rec.status, time.Since(start).Milliseconds(), cacheHit)
 	}
 }
 
 func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	cacheHit := false
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.Record(time.Since(start).Milliseconds(), rec.status < 400, cacheHit)
+		}
+	}()
+	w = rec
+
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil || len(bodyBytes) == 0 {
 		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
@@ -285,10 +327,10 @@ func (h *Handler) HandleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		Username: fmt.Sprintf("org_%d", cfg.OrgID),
 	}
 
-	inTokens, outTokens := h.handleNativeUpstream(w, r, routing, user, req.Model, bodyBytes)
+	inTokens, outTokens, cacheHit := h.handleNativeUpstream(w, r, routing, user, req.Model, bodyBytes)
 
 	// Async usage commit (non-blocking)
 	if h.usageCommitter != nil {
-		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, inTokens, outTokens)
+		h.usageCommitter.CommitAsync(cfg.OrgID, cfg.APIKeyID, routing.Model, cfg.Mode, inTokens, outTokens, rec.status, time.Since(start).Milliseconds(), cacheHit)
 	}
 }

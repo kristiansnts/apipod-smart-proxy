@@ -21,13 +21,16 @@ type UsageCommitter struct {
 
 // CommitPayload is sent to POST /api/internal/commit-usage.
 type CommitPayload struct {
-	RequestID   string `json:"request_id"`
-	OrgID       uint   `json:"org_id"`
-	APIKeyID    uint   `json:"api_key_id"`
-	Model       string `json:"model"`
-	InputTokens int    `json:"input_tokens"`
-	OutputTokens int   `json:"output_tokens"`
-	Mode        string `json:"mode"`
+	RequestID    string `json:"request_id"`
+	OrgID        uint   `json:"org_id"`
+	APIKeyID     uint   `json:"api_key_id"`
+	Model        string `json:"model"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+	Mode         string `json:"mode"`
+	StatusCode   int    `json:"status_code"`
+	LatencyMs    int64  `json:"latency_ms"`
+	CacheHit     bool   `json:"cache_hit"`
 }
 
 func NewUsageCommitter(baseURL, secret string, logger *log.Logger) *UsageCommitter {
@@ -42,7 +45,7 @@ func NewUsageCommitter(baseURL, secret string, logger *log.Logger) *UsageCommitt
 }
 
 // CommitAsync sends usage data in a goroutine. Non-blocking.
-func (uc *UsageCommitter) CommitAsync(orgID, apiKeyID uint, model, mode string, inputTokens, outputTokens int) {
+func (uc *UsageCommitter) CommitAsync(orgID, apiKeyID uint, model, mode string, inputTokens, outputTokens, statusCode int, latencyMs int64, cacheHit bool) {
 	go func() {
 		requestID := ulid.Make().String()
 
@@ -54,6 +57,9 @@ func (uc *UsageCommitter) CommitAsync(orgID, apiKeyID uint, model, mode string, 
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
 			Mode:         mode,
+			StatusCode:   statusCode,
+			LatencyMs:    latencyMs,
+			CacheHit:     cacheHit,
 		}
 
 		body, err := json.Marshal(payload)

@@ -238,7 +238,7 @@ func (h *Handler) handleToolExecutionOpenAI(openaiRespBytes []byte, routing Rout
 	// Parse the current request to accumulate messages
 	var currentReq map[string]interface{}
 	if err := json.Unmarshal(openaiRequestBytes, &currentReq); err != nil {
-		anthropicResp, in, out, tc, err2 := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
+		anthropicResp, in, out, tc, _, err2 := anthropiccompat.OpenAIResponseToAnthropic(openaiRespBytes, model)
 		if err2 != nil {
 			return openaiRespBytes, 0, 0, false, err
 		}
@@ -306,7 +306,7 @@ func (h *Handler) handleToolExecutionOpenAI(openaiRespBytes []byte, routing Rout
 			}
 
 			// No tool calls and not a thinking loop — done
-			anthropicResp, _, _, tc, err := anthropiccompat.OpenAIResponseToAnthropic(currentRespBytes, model)
+			anthropicResp, _, _, tc, _, err := anthropiccompat.OpenAIResponseToAnthropic(currentRespBytes, model)
 			if err != nil {
 				return currentRespBytes, totalInputTokens, totalOutputTokens, hasToolCall, err
 			}
@@ -386,7 +386,7 @@ func (h *Handler) handleToolExecutionOpenAI(openaiRespBytes []byte, routing Rout
 	h.runnerLogger.Printf("[tool_execution] completed with %d input + %d output tokens", totalInputTokens, totalOutputTokens)
 
 	// Convert final response to Anthropic format
-	anthropicResp, _, _, tc, err := anthropiccompat.OpenAIResponseToAnthropic(currentRespBytes, model)
+	anthropicResp, _, _, tc, _, err := anthropiccompat.OpenAIResponseToAnthropic(currentRespBytes, model)
 	if err != nil {
 		return currentRespBytes, totalInputTokens, totalOutputTokens, hasToolCall, err
 	}

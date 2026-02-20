@@ -592,25 +592,30 @@ func extractContentText(raw json.RawMessage) string {
 
 // OpenAIResponseToAnthropic converts an OpenAI chat completions response to Anthropic Messages format,
 // including tool_calls conversion to tool_use content blocks.
-func OpenAIResponseToAnthropic(body []byte, model string) ([]byte, int, int, bool, error) {
+func OpenAIResponseToAnthropic(body []byte, model string) ([]byte, int, int, bool, bool, error) {
 	var openaiResp struct {
 		ID      string `json:"id"`
 		Choices []struct {
 			Message struct {
-				Content          *string         `json:"content"`
-				ReasoningContent *string         `json:"reasoning_content,omitempty"`
+				Content          *string          `json:"content"`
+				ReasoningContent *string          `json:"reasoning_content,omitempty"`
 				ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details,omitempty"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &openaiResp); err != nil {
-		return nil, 0, 0, false, err
+		return nil, 0, 0, false, false, err
 	}
+
+	cacheHit := openaiResp.Usage.PromptTokensDetails != nil && openaiResp.Usage.PromptTokensDetails.CachedTokens > 0
 
 	var contentBlocks []map[string]interface{}
 	stopReason := "end_turn"
@@ -688,17 +693,19 @@ func OpenAIResponseToAnthropic(body []byte, model string) ([]byte, int, int, boo
 	}
 
 	out, err := json.Marshal(anthropicResp)
-	return out, openaiResp.Usage.PromptTokens, openaiResp.Usage.CompletionTokens, hasToolCall, err
+	return out, openaiResp.Usage.PromptTokens, openaiResp.Usage.CompletionTokens, hasToolCall, cacheHit, err
 }
 
 // OpenAIStreamToAnthropicStream converts an OpenAI SSE stream to Anthropic SSE stream format,
 // including tool_call streaming deltas.
-func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int, int, bool) {
+// Returns inputTokens, outputTokens, hasToolCall, cacheHit.
+func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int, int, bool, bool) {
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, len(buf))
 	inputTokens, outputTokens := 0, 0
 	hasToolCall := false
+	cacheHit := false
 	started := false
 	blockIndex := 0
 	thinkingBlockStarted := false
@@ -731,8 +738,11 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details,omitempty"`
 		} `json:"usage,omitempty"`
 	}
 
@@ -755,6 +765,9 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 		if chunk.Usage != nil {
 			inputTokens = chunk.Usage.PromptTokens
 			outputTokens = chunk.Usage.CompletionTokens
+			if chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0 {
+				cacheHit = true
+			}
 		}
 
 		if !started {
@@ -926,7 +939,7 @@ func OpenAIStreamToAnthropicStream(r io.Reader, w io.Writer, model string) (int,
 		}
 	}
 
-	return inputTokens, outputTokens, hasToolCall
+	return inputTokens, outputTokens, hasToolCall, cacheHit
 }
 
 func ProxyDirect(baseURL string, apiKey string, body []byte) (*http.Response, error) {
