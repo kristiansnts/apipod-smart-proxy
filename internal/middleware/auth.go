@@ -6,23 +6,25 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/rpay/apipod-smart-proxy/internal/database"
+	"github.com/rpay/apipod-smart-proxy/internal/config"
 )
 
 // contextKey is a custom type for context keys to avoid collisions
 type contextKey string
 
-const userContextKey contextKey = "user"
+const runtimeConfigKey contextKey = "runtime_config"
 
-// AuthMiddleware handles API key authentication
+// AuthMiddleware handles API key authentication via ConfigLoader.
+// The proxy is stateless — auth is delegated to the config loader
+// (either remote API or static file).
 type AuthMiddleware struct {
-	db     *database.DB
-	logger *log.Logger
+	configLoader config.ConfigLoader
+	logger       *log.Logger
 }
 
-// NewAuthMiddleware creates a new authentication middleware
-func NewAuthMiddleware(db *database.DB) *AuthMiddleware {
-	return &AuthMiddleware{db: db, logger: log.Default()}
+// NewAuthMiddleware creates a new authentication middleware.
+func NewAuthMiddleware(configLoader config.ConfigLoader, logger *log.Logger) *AuthMiddleware {
+	return &AuthMiddleware{configLoader: configLoader, logger: logger}
 }
 
 // Authenticate wraps an HTTP handler with API key authentication.
@@ -48,29 +50,42 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		// Validate API token
-		valid, user, err := m.db.IsValidAPIToken(apiKey)
+		// Get runtime config from config loader (remote API or static file)
+		cfg, err := m.configLoader.GetRuntimeConfig(apiKey)
 		if err != nil {
-			m.logger.Printf("Auth error for token %s...: %v", apiKey[:min(8, len(apiKey))], err)
+			m.logger.Printf("Auth error: %v", err)
 			http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
 			return
 		}
 
-		if !valid || user == nil {
-			http.Error(w, `{"error": "Invalid or expired API token"}`, http.StatusForbidden)
+		if cfg == nil || !cfg.Allowed {
+			reason := "Invalid or expired API token"
+			if cfg != nil && cfg.Reason != "" {
+				reason = cfg.Reason
+			}
+
+			// Map reason to status code
+			statusCode := http.StatusForbidden
+			if strings.Contains(reason, "Invalid") || strings.Contains(reason, "revoked") {
+				statusCode = http.StatusUnauthorized
+			} else if strings.Contains(reason, "exceeded") || strings.Contains(reason, "limit") {
+				statusCode = http.StatusTooManyRequests
+			}
+
+			http.Error(w, `{"error": "`+reason+`"}`, statusCode)
 			return
 		}
 
-		// Store user in request context for downstream handlers
-		ctx := context.WithValue(r.Context(), userContextKey, user)
+		// Store runtime config in request context for downstream handlers
+		ctx := context.WithValue(r.Context(), runtimeConfigKey, cfg)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// GetUserFromContext retrieves the authenticated user from request context
-func GetUserFromContext(ctx context.Context) *database.User {
-	if user, ok := ctx.Value(userContextKey).(*database.User); ok {
-		return user
+// GetConfigFromContext retrieves the runtime config from request context.
+func GetConfigFromContext(ctx context.Context) *config.RuntimeConfig {
+	if cfg, ok := ctx.Value(runtimeConfigKey).(*config.RuntimeConfig); ok {
+		return cfg
 	}
 	return nil
 }

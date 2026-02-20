@@ -24,9 +24,12 @@ type ChatCompletionResponse struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		TotalTokens         int `json:"total_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details,omitempty"`
 	} `json:"usage"`
 }
 
@@ -46,20 +49,24 @@ type StreamChunk struct {
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		TotalTokens         int `json:"total_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details,omitempty"`
 	} `json:"usage,omitempty"`
 }
 
-// ExtractTokens extracts token usage from a non-streaming response
-func ExtractTokens(body []byte) (int, int, error) {
+// ExtractTokens extracts token usage from a non-streaming response.
+// Returns inputTokens, outputTokens, cacheHit, error.
+func ExtractTokens(body []byte) (int, int, bool, error) {
 	var resp ChatCompletionResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
-
-	return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, nil
+	cacheHit := resp.Usage.PromptTokensDetails != nil && resp.Usage.PromptTokensDetails.CachedTokens > 0
+	return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, cacheHit, nil
 }
 
 // DetectToolCall checks if a non-streaming OpenAI response contains tool calls.
@@ -80,14 +87,15 @@ func DetectToolCall(body []byte) bool {
 }
 
 // StreamTransform passes through the OpenAI SSE stream, capturing usage tokens.
-// Returns input tokens, output tokens, and whether a tool call was detected.
-func StreamTransform(r io.Reader, w io.Writer) (int, int, bool) {
+// Returns input tokens, output tokens, hasToolCall, and cacheHit.
+func StreamTransform(r io.Reader, w io.Writer) (int, int, bool, bool) {
 	scanner := bufio.NewScanner(r)
 	// Increase buffer size to 1MB to handle large SSE chunks
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, len(buf))
 	inputTokens, outputTokens := 0, 0
 	hasToolCall := false
+	cacheHit := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -109,6 +117,9 @@ func StreamTransform(r io.Reader, w io.Writer) (int, int, bool) {
 				if chunk.Usage != nil {
 					inputTokens = chunk.Usage.PromptTokens
 					outputTokens = chunk.Usage.CompletionTokens
+					if chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0 {
+						cacheHit = true
+					}
 				}
 				// Detect tool calls in streaming chunks
 				if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != nil && *chunk.Choices[0].FinishReason == "tool_calls" {
@@ -118,5 +129,5 @@ func StreamTransform(r io.Reader, w io.Writer) (int, int, bool) {
 		}
 	}
 
-	return inputTokens, outputTokens, hasToolCall
+	return inputTokens, outputTokens, hasToolCall, cacheHit
 }

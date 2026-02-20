@@ -20,8 +20,9 @@ type AnthropicDelta struct {
 }
 
 type AnthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens          int `json:"input_tokens"`
+	OutputTokens         int `json:"output_tokens"`
+	CacheReadInputTokens int `json:"cache_read_input_tokens"`
 }
 
 // AnthropicResponse represents the Anthropic Messages API response
@@ -33,8 +34,9 @@ type AnthropicResponse struct {
 	Content    []map[string]interface{} `json:"content"`
 	StopReason string                   `json:"stop_reason"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens          int `json:"input_tokens"`
+		OutputTokens         int `json:"output_tokens"`
+		CacheReadInputTokens int `json:"cache_read_input_tokens"`
 	} `json:"usage"`
 }
 
@@ -58,14 +60,16 @@ func TransformResponse(body []byte, model string) ([]byte, int, int, error) {
 
 // TransformResponseToOpenAI converts an Anthropic Messages response to OpenAI chat completions format,
 // including tool_use blocks → tool_calls conversion.
-func TransformResponseToOpenAI(body []byte, model string) ([]byte, int, int, bool, error) {
+// Returns: transformed body, inputTokens, outputTokens, hasToolCall, cacheHit, error.
+func TransformResponseToOpenAI(body []byte, model string) ([]byte, int, int, bool, bool, error) {
 	var resp AnthropicResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, 0, 0, false, err
+		return nil, 0, 0, false, false, err
 	}
 
 	inputTokens := resp.Usage.InputTokens
 	outputTokens := resp.Usage.OutputTokens
+	cacheHit := resp.Usage.CacheReadInputTokens > 0
 	hasToolCall := false
 
 	// Build OpenAI response
@@ -139,18 +143,19 @@ func TransformResponseToOpenAI(body []byte, model string) ([]byte, int, int, boo
 	}
 
 	out, err := json.Marshal(openAIResp)
-	return out, inputTokens, outputTokens, hasToolCall, err
+	return out, inputTokens, outputTokens, hasToolCall, cacheHit, err
 }
 
 // StreamTransform passes through the Anthropic SSE stream from the upstream,
-// capturing usage tokens along the way.
-func StreamTransform(r io.Reader, w io.Writer) (int, int) {
+// capturing usage tokens and detecting prompt-cache hits (cache_read_input_tokens > 0).
+func StreamTransform(r io.Reader, w io.Writer) (int, int, bool) {
 	scanner := bufio.NewScanner(r)
 	// Increase buffer size to 1MB to handle large SSE lines (e.g. tool calls)
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, len(buf))
 
 	inputTokens, outputTokens := 0, 0
+	cacheHit := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -162,25 +167,42 @@ func StreamTransform(r io.Reader, w io.Writer) (int, int) {
 		if strings.HasPrefix(line, "data: ") {
 			data := strings.TrimPrefix(line, "data: ")
 			var event AnthropicEvent
-			if err := json.Unmarshal([]byte(data), &event); err == nil && event.Usage != nil {
-				inputTokens = event.Usage.InputTokens
-				outputTokens = event.Usage.OutputTokens
+			if err := json.Unmarshal([]byte(data), &event); err == nil {
+				if event.Usage != nil {
+					inputTokens = event.Usage.InputTokens
+					outputTokens = event.Usage.OutputTokens
+				}
+				// message_start carries cache_read in message.usage
+				if event.Type == "message_start" {
+					var start struct {
+						Message struct {
+							Usage struct {
+								CacheReadInputTokens int `json:"cache_read_input_tokens"`
+							} `json:"usage"`
+						} `json:"message"`
+					}
+					if json.Unmarshal([]byte(data), &start) == nil && start.Message.Usage.CacheReadInputTokens > 0 {
+						cacheHit = true
+					}
+				}
 			}
 		}
 	}
 
-	return inputTokens, outputTokens
+	return inputTokens, outputTokens, cacheHit
 }
 
 // StreamTransformToOpenAI converts an Anthropic SSE stream to OpenAI SSE stream format,
 // including tool_use blocks → tool_calls deltas.
-func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, bool) {
+// Returns inputTokens, outputTokens, hasToolCall, cacheHit.
+func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, bool, bool) {
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, len(buf))
 
 	inputTokens, outputTokens := 0, 0
 	hasToolCall := false
+	cacheHit := false
 	sentFirstChunk := false
 	messageID := ""
 	toolCallIndex := 0
@@ -210,6 +232,9 @@ func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, 
 				if usage, ok := msg["usage"].(map[string]interface{}); ok {
 					if v, ok := usage["input_tokens"].(float64); ok {
 						inputTokens = int(v)
+					}
+					if v, ok := usage["cache_read_input_tokens"].(float64); ok && v > 0 {
+						cacheHit = true
 					}
 				}
 			}
@@ -297,7 +322,7 @@ func StreamTransformToOpenAI(r io.Reader, w io.Writer, model string) (int, int, 
 		}
 	}
 
-	return inputTokens, outputTokens, hasToolCall
+	return inputTokens, outputTokens, hasToolCall, cacheHit
 }
 
 func writeOpenAISSE(w io.Writer, id string, model string, delta map[string]interface{}, toolCalls []map[string]interface{}) {
