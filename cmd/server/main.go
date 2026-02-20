@@ -12,7 +12,6 @@ import (
 	"github.com/rpay/apipod-smart-proxy/internal/admin"
 	"github.com/rpay/apipod-smart-proxy/internal/config"
 	"github.com/rpay/apipod-smart-proxy/internal/database"
-	"github.com/rpay/apipod-smart-proxy/internal/deviceauth"
 	"github.com/rpay/apipod-smart-proxy/internal/middleware"
 	"github.com/rpay/apipod-smart-proxy/internal/pool"
 	"github.com/rpay/apipod-smart-proxy/internal/proxy"
@@ -54,8 +53,6 @@ func main() {
 	adminHandler := admin.NewHandler(db, cfg.AdminSecret)
 	proxyRouter := proxy.NewRouter(db)
 	modelLimiter := pool.NewModelLimiter()
-	deviceStore := deviceauth.NewStore()
-	deviceHandler := deviceauth.NewHandler(deviceStore, cfg.DashboardURL)
 
 	proxyHandler := proxy.NewHandler(proxyRouter, db, logger, runnerLogger, modelLimiter)
 
@@ -63,9 +60,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", proxy.HealthCheck)
 	mux.HandleFunc("/admin/create-key", adminHandler.CreateAPIKey)
-	mux.HandleFunc("/auth/device/code", deviceHandler.HandleDeviceCode)
-	mux.HandleFunc("/auth/device/token", deviceHandler.HandleDeviceToken)
-	mux.HandleFunc("/auth/device/authorize", deviceHandler.HandleAuthorize)
 	mux.Handle("/v1/chat/completions",
 		loggingMiddleware.LogRequest(
 			authMiddleware.Authenticate(
@@ -88,9 +82,6 @@ func main() {
 		logger.Println("Routes:")
 		logger.Println("  GET  /health                 - Health check")
 		logger.Println("  POST /admin/create-key       - Create API token (x-admin-secret required)")
-		logger.Println("  POST /auth/device/code       - Request device code for CLI login")
-		logger.Println("  POST /auth/device/token      - Poll for device authorization")
-		logger.Println("  POST /auth/device/authorize   - Authorize device (dashboard)")
 		logger.Println("  POST /v1/chat/completions    - Chat completions (Bearer token required)")
 		logger.Println("  POST /v1/messages            - Anthropic Messages API (x-api-key or Bearer token)")
 		logger.Println("")
