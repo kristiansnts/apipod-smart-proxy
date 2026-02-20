@@ -18,37 +18,6 @@ type User struct {
 	ExpiresAt *time.Time
 }
 
-// CreateUser inserts a new user into the database with a ULID primary key
-func (db *DB) CreateUser(username, apiToken string, subID int64, expiresAt *time.Time) (*User, error) {
-	query := `
-		INSERT INTO users (name, apitoken, sub_id, expires_at)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id::text, name, apitoken, sub_id, active, created_at, expires_at
-	`
-
-	var user User
-	var expiresAtSQL sql.NullTime
-
-	err := db.conn.QueryRow(query, username, apiToken, subID, expiresAt).Scan(
-		&user.ID,
-		&user.Username,
-		&user.APIToken,
-		&user.SubID,
-		&user.Active,
-		&user.CreatedAt,
-		&expiresAtSQL,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create user: %w", err)
-	}
-
-	if expiresAtSQL.Valid {
-		user.ExpiresAt = &expiresAtSQL.Time
-	}
-
-	return &user, nil
-}
-
 // GetUserByAPIToken retrieves a user (with subscription name) by their API token
 func (db *DB) GetUserByAPIToken(apiToken string) (*User, error) {
 	query := `
