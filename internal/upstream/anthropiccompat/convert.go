@@ -1212,6 +1212,12 @@ func loadMCPTools() ([]interface{}, error) {
 	return orchestrator.LoadAllTools()
 }
 
+// CapMaxTokens caps the requested token count to the known limit for the given model.
+// This is exported so the proxy can re-apply limits after model routing.
+func CapMaxTokens(model string, requestedTokens int) int {
+	return getMaxTokensForModel(model, requestedTokens)
+}
+
 func getMaxTokensForModel(model string, requestedTokens int) int {
 	modelLimits := map[string]int{
 		"gpt-3.5-turbo":     4096,

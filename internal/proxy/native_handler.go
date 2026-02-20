@@ -460,6 +460,27 @@ func (h *Handler) handleOpenAICompatFromAnthropic(w http.ResponseWriter, r *http
 	var body map[string]interface{}
 	json.Unmarshal(openaiBody, &body)
 	body["model"] = routing.Model
+
+	// Re-cap max_tokens using the routed model name, since the original request used
+	// the client-facing model name (e.g. claude-sonnet-4-6) not the actual upstream model.
+	if mt, ok := body["max_tokens"].(float64); ok {
+		body["max_tokens"] = anthropiccompat.CapMaxTokens(routing.Model, int(mt))
+	}
+
+	// DeepSeek Reasoner requires reasoning_content on every assistant message in history.
+	// Inject empty string for any assistant message that lacks it.
+	if strings.Contains(routing.BaseURL, "deepseek.com") {
+		if msgs, ok := body["messages"].([]interface{}); ok {
+			for _, m := range msgs {
+				if msg, ok := m.(map[string]interface{}); ok && msg["role"] == "assistant" {
+					if _, has := msg["reasoning_content"]; !has {
+						msg["reasoning_content"] = ""
+					}
+				}
+			}
+		}
+	}
+
 	openaiBody, _ = json.Marshal(body)
 
 	path := "/v1/chat/completions"
